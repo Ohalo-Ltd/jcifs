@@ -96,6 +96,10 @@ public class Smb2QueryDirectoryResponse extends ServerMessageBlock2Response {
         final int bufferLength = SMBUtil.readInt4(buffer, bufferIndex);
         bufferIndex += 4;
 
+        if (bufferLength < 0 || bufferOffset < 0 || (long) bufferOffset + bufferLength > buffer.length) {
+            throw new SMBProtocolDecodingException("Invalid query directory buffer offset/length");
+        }
+
         // bufferIndex = bufferOffset;
 
         final List<FileEntry> infos = new ArrayList<>();
@@ -108,6 +112,9 @@ public class Smb2QueryDirectoryResponse extends ServerMessageBlock2Response {
             infos.add(cur);
             final int nextEntryOffset = cur.getNextEntryOffset();
             if (nextEntryOffset <= 0) {
+                break;
+            }
+            if ((long) bufferIndex + nextEntryOffset >= (long) bufferOffset + bufferLength) {
                 break;
             }
             bufferIndex += nextEntryOffset;
