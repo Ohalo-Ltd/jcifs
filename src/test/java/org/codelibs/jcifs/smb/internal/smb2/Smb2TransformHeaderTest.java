@@ -125,11 +125,11 @@ class Smb2TransformHeaderTest extends BaseTest {
         // Then
         assertEquals(52, encoded);
 
-        // Verify protocol ID (first 4 bytes) - 0xFD534D42 in little-endian
-        assertEquals((byte) 0x42, buffer[0]);
-        assertEquals((byte) 0x4D, buffer[1]);
-        assertEquals((byte) 0x53, buffer[2]);
-        assertEquals((byte) 0xFD, buffer[3]);
+        // Verify protocol ID wire order 0xFD 'S' 'M' 'B'
+        assertEquals((byte) 0xFD, buffer[0]);
+        assertEquals((byte) 'S', buffer[1]);
+        assertEquals((byte) 'M', buffer[2]);
+        assertEquals((byte) 'B', buffer[3]);
     }
 
     @Test
@@ -139,11 +139,11 @@ class Smb2TransformHeaderTest extends BaseTest {
         byte[] buffer = new byte[52];
         int index = 0;
 
-        // Protocol ID - 0xFD534D42 in little-endian
-        buffer[index++] = (byte) 0x42;
-        buffer[index++] = (byte) 0x4D;
-        buffer[index++] = (byte) 0x53;
+        // Protocol ID wire order 0xFD 'S' 'M' 'B'
         buffer[index++] = (byte) 0xFD;
+        buffer[index++] = (byte) 'S';
+        buffer[index++] = (byte) 'M';
+        buffer[index++] = (byte) 'B';
 
         // Signature (16 bytes)
         byte[] signature = new byte[16];
@@ -350,23 +350,40 @@ class Smb2TransformHeaderTest extends BaseTest {
         // When
         byte[] aad = transformHeader.getAssociatedData();
 
-        // Then
-        assertEquals(52, aad.length); // AAD should be same size as transform header
+        // Then - per MS-SMB2 3.1.4.3 the AAD is the header from the Nonce field
+        // onward: Nonce, OriginalMessageSize, Reserved, Flags, SessionId. The
+        // ProtocolId and Signature fields are not authenticated data.
+        assertEquals(32, aad.length, "AAD covers the 32 bytes from Nonce through SessionId");
 
-        // Verify protocol ID (first 4 bytes) - 0xFD534D42 in little-endian
-        assertEquals((byte) 0x42, aad[0]);
-        assertEquals((byte) 0x4D, aad[1]);
-        assertEquals((byte) 0x53, aad[2]);
-        assertEquals((byte) 0xFD, aad[3]);
-
-        // Verify signature is zeroed out (16 bytes of zeros)
-        for (int i = 4; i < 20; i++) {
-            assertEquals(0, aad[i], "Signature bytes should be zero in AAD");
+        // Nonce at offset 0
+        for (int i = 0; i < 16; i++) {
+            assertEquals(testNonce[i], aad[i], "Nonce should match at position " + i);
         }
 
-        // Verify nonce matches at position 20
-        for (int i = 0; i < 16; i++) {
-            assertEquals(testNonce[i], aad[20 + i], "Nonce should match at position " + (20 + i));
+        // OriginalMessageSize (LE) at offset 16
+        assertEquals((byte) 0x00, aad[16]);
+        assertEquals((byte) 0x04, aad[17]);
+        assertEquals((byte) 0x00, aad[18]);
+        assertEquals((byte) 0x00, aad[19]);
+
+        // Reserved at offset 20
+        assertEquals(0, aad[20]);
+        assertEquals(0, aad[21]);
+
+        // Flags (LE) at offset 22
+        assertEquals((byte) 0x01, aad[22]);
+        assertEquals((byte) 0x00, aad[23]);
+
+        // SessionId (LE) at offset 24
+        for (int i = 0; i < 8; i++) {
+            assertEquals((byte) (testSessionId >>> (8 * i)), aad[24 + i], "SessionId byte " + i);
+        }
+
+        // The AAD must be exactly the encoded header from the Nonce field on
+        byte[] encoded = new byte[52];
+        transformHeader.encode(encoded, 0);
+        for (int i = 0; i < 32; i++) {
+            assertEquals(encoded[20 + i], aad[i], "AAD must mirror the wire header at offset " + (20 + i));
         }
     }
 

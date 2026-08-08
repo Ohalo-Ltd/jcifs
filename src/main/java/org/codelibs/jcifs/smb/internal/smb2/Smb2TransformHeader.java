@@ -185,8 +185,11 @@ public class Smb2TransformHeader implements Encodable {
     public int encode(final byte[] dst, int dstIndex) {
         final int start = dstIndex;
 
-        // Protocol ID
-        SMBUtil.writeInt4(TRANSFORM_PROTOCOL_ID, dst, dstIndex);
+        // Protocol ID, wire order 0xFD 'S' 'M' 'B'
+        dst[dstIndex] = (byte) 0xFD;
+        dst[dstIndex + 1] = (byte) 'S';
+        dst[dstIndex + 2] = (byte) 'M';
+        dst[dstIndex + 3] = (byte) 'B';
         dstIndex += 4;
 
         // Signature (16 bytes)
@@ -228,10 +231,10 @@ public class Smb2TransformHeader implements Encodable {
     public static Smb2TransformHeader decode(final byte[] buffer, int bufferIndex) {
         final Smb2TransformHeader header = new Smb2TransformHeader();
 
-        // Check protocol ID
-        final int protocolId = SMBUtil.readInt4(buffer, bufferIndex);
-        if (protocolId != TRANSFORM_PROTOCOL_ID) {
-            throw new IllegalArgumentException("Invalid transform header protocol ID: 0x" + Integer.toHexString(protocolId));
+        // Check protocol ID, wire order 0xFD 'S' 'M' 'B'
+        if (buffer[bufferIndex] != (byte) 0xFD || buffer[bufferIndex + 1] != (byte) 'S' || buffer[bufferIndex + 2] != (byte) 'M'
+                || buffer[bufferIndex + 3] != (byte) 'B') {
+            throw new IllegalArgumentException("Invalid transform header protocol ID");
         }
         bufferIndex += 4;
 
@@ -261,20 +264,18 @@ public class Smb2TransformHeader implements Encodable {
     }
 
     /**
-     * Get the associated data for AEAD encryption (everything except signature)
+     * Get the associated data for AEAD encryption.
+     *
+     * Per MS-SMB2 3.1.4.3 this is the transform header from the Nonce field
+     * onward - Nonce, OriginalMessageSize, Reserved, Flags/EncryptionAlgorithm
+     * and SessionId, in that order (32 bytes). The ProtocolId and Signature
+     * fields are not part of the authenticated data.
      *
      * @return byte array containing associated data
      */
     public byte[] getAssociatedData() {
-        final byte[] aad = new byte[52]; // Use full header size to ensure all data fits
+        final byte[] aad = new byte[32];
         int index = 0;
-
-        // Protocol ID
-        SMBUtil.writeInt4(TRANSFORM_PROTOCOL_ID, aad, index);
-        index += 4;
-
-        // Skip signature (16 bytes of zeros for AAD)
-        index += 16;
 
         // Nonce
         System.arraycopy(this.nonce, 0, aad, index, 16);
