@@ -76,6 +76,8 @@ public class BaseConfiguration implements Configuration {
     protected boolean ipcSigningEnforced = true;
     /** Whether SMB3 encryption is enabled */
     protected boolean encryptionEnabled = false;
+    /** Whether SMB3 encryption is required, failing connections that cannot encrypt */
+    protected boolean encryptionRequired = false;
     /** Whether to use NT status codes instead of DOS error codes */
     protected boolean useNtStatus = true;
     /** Whether to use extended security negotiation */
@@ -555,6 +557,11 @@ public class BaseConfiguration implements Configuration {
     @Override
     public boolean isEncryptionEnabled() {
         return this.encryptionEnabled;
+    }
+
+    @Override
+    public boolean isEncryptionRequired() {
+        return this.encryptionRequired;
     }
 
     @Override

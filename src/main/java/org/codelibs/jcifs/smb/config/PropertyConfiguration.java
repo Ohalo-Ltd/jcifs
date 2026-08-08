@@ -51,6 +51,7 @@ public final class PropertyConfiguration extends BaseConfiguration implements Co
         this.signingEnforced = Config.getBoolean(p, "jcifs.client.signingEnforced", false);
         this.ipcSigningEnforced = Config.getBoolean(p, "jcifs.client.ipcSigningEnforced", true);
         this.encryptionEnabled = Config.getBoolean(p, "jcifs.client.encryptionEnabled", false);
+        this.encryptionRequired = Config.getBoolean(p, "jcifs.client.encryptionRequired", false);
         this.requireSecureNegotiate = Config.getBoolean(p, "jcifs.client.requireSecureNegotiate", true);
         this.sendNTLMTargetName = Config.getBoolean(p, "jcifs.client.SendNTLMTargetName", true);
 

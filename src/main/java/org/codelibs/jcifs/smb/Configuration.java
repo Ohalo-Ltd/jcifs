@@ -499,6 +499,18 @@ public interface Configuration {
     boolean isEncryptionEnabled();
 
     /**
+     * Property {@code org.codelibs.jcifs.smb.impl.client.encryptionRequired} (boolean, default false)
+     *
+     * Demand SMB3 channel encryption for all connections: sessions on servers
+     * that cannot or will not encrypt fail with a clear error instead of
+     * falling back to a cleartext conversation. Implies advertising encryption
+     * support during negotiation.
+     *
+     * @return whether SMB encryption is required
+     */
+    boolean isEncryptionRequired();
+
+    /**
      *
      * Property {@code org.codelibs.jcifs.smb.impl.client.forceExtendedSecurity} (boolean, default false)
      *

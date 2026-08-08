@@ -520,7 +520,9 @@ final class SmbSessionImpl implements SmbSessionInternal {
             log.debug("Initial session preauth hash " + Hexdump.toHexString(this.preauthIntegrityHash));
         }
 
-        this.encryptData = false;
+        // a client-side encryption requirement encrypts the whole session,
+        // exactly like the server-side SMB2_SESSION_FLAG_ENCRYPT_DATA
+        this.encryptData = getConfig().isEncryptionRequired();
         this.encryptionContext = null;
         this.encryptedTreeIds.clear();
 
@@ -656,7 +658,9 @@ final class SmbSessionImpl implements SmbSessionInternal {
                         log.debug("Failed to create encryption context, encryption will not be available", e);
                     }
                 } else if (this.encryptData) {
-                    throw new SmbAuthException("Server requires encryption but encryption was not negotiated");
+                    // required by the server's session flag or by the client's
+                    // configuration, but the negotiation selected no cipher
+                    throw new SmbUnsupportedOperationException("Encryption is required but was not negotiated");
                 }
 
                 setSessionSetup(response);
@@ -835,6 +839,10 @@ final class SmbSessionImpl implements SmbSessionInternal {
      */
     private void sessionSetupSMB1(final SmbTransportImpl trans, final String tdomain, ServerMessageBlock andx,
             ServerMessageBlock andxResponse) throws CIFSException, GeneralSecurityException {
+        if (getConfig().isEncryptionRequired()) {
+            // channel encryption does not exist before SMB 3.0
+            throw new SmbUnsupportedOperationException("Encryption is required but the server only supports SMB1");
+        }
         SmbException ex = null;
         SmbComSessionSetupAndX request = null;
         SmbComSessionSetupAndXResponse response = null;

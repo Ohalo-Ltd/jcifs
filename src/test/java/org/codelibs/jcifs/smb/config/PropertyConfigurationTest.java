@@ -219,6 +219,18 @@ class PropertyConfigurationTest extends BaseTest {
     }
 
     @Test
+    @DisplayName("Should parse jcifs.client.encryptionRequired, defaulting to false")
+    void testEncryptionRequiredProperty() throws CIFSException {
+        // default: not required
+        assertFalse(new PropertyConfiguration(new Properties()).isEncryptionRequired());
+
+        // explicit
+        Properties props = new Properties();
+        props.setProperty("jcifs.client.encryptionRequired", "true");
+        assertTrue(new PropertyConfiguration(props).isEncryptionRequired());
+    }
+
+    @Test
     @DisplayName("Should handle invalid property values gracefully")
     void testInvalidPropertyValues() throws CIFSException {
         // Given

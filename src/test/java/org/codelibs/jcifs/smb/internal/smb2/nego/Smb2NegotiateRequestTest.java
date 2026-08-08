@@ -155,6 +155,28 @@ class Smb2NegotiateRequestTest {
     }
 
     @Test
+    @DisplayName("Requiring encryption implies advertising it")
+    void testEncryptionRequiredImpliesAdvertising() {
+        // Given - encryption not enabled, but required
+        when(mockConfig.isEncryptionEnabled()).thenReturn(false);
+        when(mockConfig.isEncryptionRequired()).thenReturn(true);
+        when(mockConfig.getMaximumVersion()).thenReturn(DialectVersion.SMB311);
+
+        // When
+        request = new Smb2NegotiateRequest(mockConfig, 0);
+
+        // Then - the capability and an encryption negotiate context are offered
+        assertEquals(Smb2Constants.SMB2_GLOBAL_CAP_ENCRYPTION, request.getCapabilities() & Smb2Constants.SMB2_GLOBAL_CAP_ENCRYPTION);
+        boolean hasEncryptionContext = false;
+        for (NegotiateContextRequest ctx : request.getNegotiateContexts()) {
+            if (ctx instanceof EncryptionNegotiateContext) {
+                hasEncryptionContext = true;
+            }
+        }
+        assertTrue(hasEncryptionContext, "An encryption negotiate context must be offered when encryption is required");
+    }
+
+    @Test
     @DisplayName("Should generate correct dialect list")
     void testDialectGeneration() {
         // Given

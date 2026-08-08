@@ -619,6 +619,16 @@ public class DelegatingConfiguration implements Configuration {
     /**
      * {@inheritDoc}
      *
+     * @see org.codelibs.jcifs.smb.Configuration#isEncryptionRequired()
+     */
+    @Override
+    public boolean isEncryptionRequired() {
+        return this.delegate.isEncryptionRequired();
+    }
+
+    /**
+     * {@inheritDoc}
+     *
      * @see org.codelibs.jcifs.smb.Configuration#getLmHostsFileName()
      */
     @Override

@@ -286,7 +286,7 @@ public class Smb2NegotiateResponse extends ServerMessageBlock2Response implement
         this.commonCapabilities = r.getCapabilities() & this.capabilities;
 
         if ((this.commonCapabilities & Smb2Constants.SMB2_GLOBAL_CAP_ENCRYPTION) != 0) {
-            this.supportsEncryption = tc.getConfig().isEncryptionEnabled();
+            this.supportsEncryption = tc.getConfig().isEncryptionEnabled() || tc.getConfig().isEncryptionRequired();
         }
 
         if (this.selectedDialect.atLeast(DialectVersion.SMB311) && !checkNegotiateContexts(r, this.commonCapabilities)) {
