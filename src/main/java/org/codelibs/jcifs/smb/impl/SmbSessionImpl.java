@@ -373,7 +373,10 @@ final class SmbSessionImpl implements SmbSessionInternal {
                 request.setSessionId(this.sessionId);
                 request.setUid(this.uid);
 
-                if (request.getDigest() == null) {
+                if (request.getDigest() == null && !isRequestEncrypted(request)) {
+                    // encrypted messages are not signed - if the request carried a
+                    // digest the response would expect a signature the server,
+                    // correctly, never produces on an encrypted reply
                     request.setDigest(getDigest());
                 }
 
@@ -1110,7 +1113,10 @@ final class SmbSessionImpl implements SmbSessionInternal {
 
                 if (!inError && trans.isSMB2()) {
                     Smb2LogoffRequest request = new Smb2LogoffRequest(getConfig());
-                    request.setDigest(getDigest());
+                    if (this.encryptionContext == null) {
+                        // the logoff of an encrypting session is itself encrypted, not signed
+                        request.setDigest(getDigest());
+                    }
                     request.setSessionId(this.sessionId);
                     try {
                         this.transport.send(request.ignoreDisconnect(), null);
@@ -1221,6 +1227,16 @@ final class SmbSessionImpl implements SmbSessionInternal {
      */
     public boolean isFailed() {
         return this.transport.isFailed();
+    }
+
+    /**
+     * Checks whether a request will leave this session encrypted.
+     *
+     * @param request the outbound request (head of a compound chain)
+     * @return whether the transport will wrap it in a transform header
+     */
+    private boolean isRequestEncrypted(final CommonServerMessageBlockRequest request) {
+        return this.encryptionContext != null && request instanceof ServerMessageBlock2 s2 && !s2.isEncryptionExempt();
     }
 
     /**

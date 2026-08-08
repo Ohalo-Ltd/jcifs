@@ -451,6 +451,120 @@ class SmbTransportImplTest {
         }
     }
 
+    @Nested
+    @DisplayName("Encrypted send path")
+    class EncryptedSend {
+
+        private static final long SESSION_ID = 0x11223344L;
+
+        private java.io.ByteArrayOutputStream out;
+        private Smb2EncryptionContext peerCtx;
+
+        @BeforeEach
+        void setUpEncryptedTransport() {
+            out = new java.io.ByteArrayOutputStream();
+            setField(transport, "smb2", true);
+            setField(transport, "out", out);
+            when(ctx.getBufferCache()).thenReturn(new BufferCacheImpl(8, 0x10000 + 128));
+
+            byte[] k1 = new byte[16];
+            byte[] k2 = new byte[16];
+            java.util.Arrays.fill(k1, (byte) 1);
+            java.util.Arrays.fill(k2, (byte) 2);
+            Smb2EncryptionContext sendCtx =
+                    new Smb2EncryptionContext(EncryptionNegotiateContext.CIPHER_AES128_GCM, DialectVersion.SMB311, k1, k2);
+            // the peer decrypts with mirrored keys
+            peerCtx = new Smb2EncryptionContext(EncryptionNegotiateContext.CIPHER_AES128_GCM, DialectVersion.SMB311, k2, k1);
+
+            SmbSessionImpl sess = mock(SmbSessionImpl.class);
+            when(sess.getEncryptionContext()).thenReturn(sendCtx);
+            transport.registerSession(SESSION_ID, sess);
+        }
+
+        private byte[] decryptWire(byte[] wire) throws Exception {
+            int nbssLen = (wire[1] & 0xFF) << 16 | (wire[2] & 0xFF) << 8 | wire[3] & 0xFF;
+            assertEquals(wire.length - 4, nbssLen, "NBSS length must cover the whole transform frame");
+            assertEquals((byte) 0xFD, wire[4], "Encrypted frames start with the transform protocol ID");
+            assertEquals((byte) 'S', wire[5]);
+            assertEquals((byte) 'M', wire[6]);
+            assertEquals((byte) 'B', wire[7]);
+            return peerCtx.decryptMessage(java.util.Arrays.copyOfRange(wire, 4, wire.length));
+        }
+
+        @Test
+        @DisplayName("doSend encrypts a session-bound message into a transform frame")
+        void doSend_encrypts() throws Exception {
+            org.codelibs.jcifs.smb.internal.smb2.Smb2EchoRequest req = new org.codelibs.jcifs.smb.internal.smb2.Smb2EchoRequest(cfg);
+            req.setSessionId(SESSION_ID);
+
+            transport.doSend(req);
+
+            byte[] plain = decryptWire(out.toByteArray());
+            assertEquals((byte) 0xFE, plain[0], "Decrypted payload must be a regular SMB2 message");
+            assertEquals(0x0D, org.codelibs.jcifs.smb.util.Encdec.dec_uint16le(plain, 12), "Command must be ECHO");
+            assertEquals(SESSION_ID, org.codelibs.jcifs.smb.util.Encdec.dec_uint64le(plain, 40), "Session ID must be preserved");
+            assertEquals(0,
+                    org.codelibs.jcifs.smb.util.Encdec.dec_uint32le(plain, 16)
+                            & org.codelibs.jcifs.smb.internal.smb2.ServerMessageBlock2.SMB2_FLAGS_SIGNED,
+                    "Encrypted messages must not carry the SIGNED flag");
+        }
+
+        @Test
+        @DisplayName("doSend never signs an encrypted message")
+        void doSend_suppressesSigning() throws Exception {
+            org.codelibs.jcifs.smb.internal.smb2.Smb2EchoRequest req = new org.codelibs.jcifs.smb.internal.smb2.Smb2EchoRequest(cfg);
+            req.setSessionId(SESSION_ID);
+            org.codelibs.jcifs.smb.internal.smb2.Smb2SigningDigest digest =
+                    mock(org.codelibs.jcifs.smb.internal.smb2.Smb2SigningDigest.class);
+            req.setDigest(digest);
+
+            transport.doSend(req);
+
+            verify(digest, org.mockito.Mockito.never()).sign(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyInt(),
+                    org.mockito.ArgumentMatchers.anyInt(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+            assertNull(req.getDigest(), "The digest must be cleared on the encrypted path");
+        }
+
+        @Test
+        @DisplayName("doSend leaves SESSION_SETUP and unknown sessions in cleartext")
+        void doSend_cleartextExemptions() throws Exception {
+            // SESSION_SETUP carrying an interim session ID stays cleartext
+            org.codelibs.jcifs.smb.internal.smb2.Smb2EchoRequest setup = new org.codelibs.jcifs.smb.internal.smb2.Smb2EchoRequest(cfg);
+            setup.setCommand(0x01); // SMB2_SESSION_SETUP
+            setup.setSessionId(SESSION_ID);
+            transport.doSend(setup);
+            assertEquals((byte) 0xFE, out.toByteArray()[4], "SESSION_SETUP must never be encrypted");
+
+            // a session without encryption context stays cleartext
+            out.reset();
+            org.codelibs.jcifs.smb.internal.smb2.Smb2EchoRequest other = new org.codelibs.jcifs.smb.internal.smb2.Smb2EchoRequest(cfg);
+            other.setSessionId(0x999L);
+            transport.doSend(other);
+            assertEquals((byte) 0xFE, out.toByteArray()[4], "Sessions without encryption context send cleartext");
+        }
+
+        @Test
+        @DisplayName("doSend encrypts a compound chain as one transform blob")
+        void doSend_encryptsCompoundChain() throws Exception {
+            org.codelibs.jcifs.smb.internal.smb2.Smb2EchoRequest first = new org.codelibs.jcifs.smb.internal.smb2.Smb2EchoRequest(cfg);
+            org.codelibs.jcifs.smb.internal.smb2.Smb2EchoRequest second = new org.codelibs.jcifs.smb.internal.smb2.Smb2EchoRequest(cfg);
+            first.chain(second);
+            first.setSessionId(SESSION_ID);
+
+            transport.doSend(first);
+
+            byte[] wire = out.toByteArray();
+            byte[] plain = decryptWire(wire);
+            int nextCommand = org.codelibs.jcifs.smb.util.Encdec.dec_uint32le(plain, 20);
+            assertTrue(nextCommand > 0, "The compound chain must be present in one plaintext blob");
+            assertEquals(0x0D, org.codelibs.jcifs.smb.util.Encdec.dec_uint16le(plain, nextCommand + 12),
+                    "The chained command must follow at the NextCommand offset");
+            // exactly one frame was written for the whole chain
+            int nbssLen = (wire[1] & 0xFF) << 16 | (wire[2] & 0xFF) << 8 | wire[3] & 0xFF;
+            assertEquals(wire.length, 4 + nbssLen, "The chain must be framed as a single encrypted message");
+        }
+    }
+
     @Test
     @DisplayName("getRequestSecurityMode honors enforced and server-required flags")
     void requestSecurityMode() {

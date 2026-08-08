@@ -335,6 +335,20 @@ public abstract class ServerMessageBlock2 implements CommonServerMessageBlock {
     }
 
     /**
+     * Checks whether this message must always be sent in cleartext.
+     *
+     * NEGOTIATE and SESSION_SETUP are exempt from transform-header encryption
+     * per MS-SMB2 3.2.4.1.8 - encrypting them is a protocol error. For a
+     * compound chain the head's command decides, as the chain is framed (and
+     * thus encrypted) as a single message.
+     *
+     * @return whether this command is exempt from encryption
+     */
+    public final boolean isEncryptionExempt() {
+        return this.command == SMB2_NEGOTIATE || this.command == SMB2_SESSION_SETUP;
+    }
+
+    /**
      * Gets the status code for this message.
      *
      * @return the status

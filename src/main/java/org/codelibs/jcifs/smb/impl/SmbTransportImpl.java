@@ -887,9 +887,19 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
         final byte[] buffer = this.getContext().getBufferCache().getBuffer();
         try {
             // synchronize around encode and write so that the ordering for SMB1 signing can be maintained
+            // (encryption nonce generation also stays in write order under this lock)
             synchronized (this.outLock) {
+                final Smb2EncryptionContext ectx = resolveEncryptionContext(smb);
+                final long sessionId;
+                if (ectx != null) {
+                    // encrypted messages are never signed - the transform header's
+                    // AEAD tag protects them (MS-SMB2 3.2.4.1.1)
+                    smb.setDigest(null);
+                    sessionId = ((ServerMessageBlock2) smb).getSessionId();
+                } else {
+                    sessionId = 0;
+                }
                 final int n = smb.encode(buffer, 4);
-                Encdec.enc_uint32be(n & 0xFFFF, buffer, 0); /* 4 byte session message header */
                 if (log.isTraceEnabled()) {
                     do {
                         log.trace(smb.toString());
@@ -897,17 +907,66 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
                     log.trace(Hexdump.toHexString(buffer, 4, n));
 
                 }
-                /*
-                 * For some reason this can sometimes get broken up into another
-                 * "NBSS Continuation Message" frame according to WireShark
-                 */
+                if (ectx != null) {
+                    sendEncrypted(ectx, sessionId, buffer, n);
+                } else {
+                    Encdec.enc_uint32be(n & 0xFFFF, buffer, 0); /* 4 byte session message header */
+                    /*
+                     * For some reason this can sometimes get broken up into another
+                     * "NBSS Continuation Message" frame according to WireShark
+                     */
 
-                this.out.write(buffer, 0, 4 + n);
-                this.out.flush();
+                    this.out.write(buffer, 0, 4 + n);
+                    this.out.flush();
+                }
             }
         } finally {
             this.getContext().getBufferCache().releaseBuffer(buffer);
         }
+    }
+
+    /**
+     * Decide whether an outbound message must be encrypted and resolve the
+     * context to encrypt it with.
+     *
+     * @param smb the outbound message (head of a compound chain)
+     * @return the encryption context to use, or null to send in cleartext
+     */
+    private Smb2EncryptionContext resolveEncryptionContext(final CommonServerMessageBlock smb) {
+        if (!this.smb2 || !(smb instanceof ServerMessageBlock2 s2) || s2.isEncryptionExempt()) {
+            return null;
+        }
+        final long sessionId = s2.getSessionId();
+        if (sessionId == 0) {
+            return null;
+        }
+        return encryptionContextFor(sessionId);
+    }
+
+    /**
+     * Encrypt the encoded message and write it as a transform-header frame.
+     *
+     * @param ectx the session's encryption context
+     * @param sessionId session the message belongs to
+     * @param buffer buffer holding the encoded plaintext at offset 4
+     * @param len plaintext length
+     */
+    private void sendEncrypted(final Smb2EncryptionContext ectx, final long sessionId, final byte[] buffer, final int len)
+            throws IOException {
+        final byte[] plain = new byte[len];
+        System.arraycopy(buffer, 4, plain, 0, len);
+        final byte[] frame;
+        try {
+            frame = ectx.encryptMessage(plain, sessionId);
+        } catch (final CIFSException e) {
+            throw new IOException("Failed to encrypt message", e);
+        }
+        final byte[] wire = new byte[4 + frame.length];
+        // encrypted frames can exceed 0xFFFF, the direct TCP length field is 3 bytes
+        Encdec.enc_uint32be(frame.length & 0xFFFFFF, wire, 0);
+        System.arraycopy(frame, 0, wire, 4, frame.length);
+        this.out.write(wire, 0, wire.length);
+        this.out.flush();
     }
 
     @SuppressWarnings("unchecked")
