@@ -439,6 +439,11 @@ class Smb3KeyDerivationTest {
      * of the BouncyCastle KDF used by production so it can pin the label constants.
      */
     private static byte[] deriveOracle(final String label, final byte[] context, final byte[] sessionKey) throws Exception {
+        return deriveOracle(label, context, sessionKey, 16);
+    }
+
+    private static byte[] deriveOracle(final String label, final byte[] context, final byte[] sessionKey, final int keyLength)
+            throws Exception {
         final byte[] ascii = label.getBytes(StandardCharsets.US_ASCII);
         final ByteArrayOutputStream fixedInput = new ByteArrayOutputStream();
         fixedInput.writeBytes(new byte[] { 0x00, 0x00, 0x00, 0x01 }); // counter i = 1 (4-byte BE, r = 32)
@@ -446,12 +451,13 @@ class Smb3KeyDerivationTest {
         fixedInput.write(0x00); // label null terminator (toCBytes)
         fixedInput.write(0x00); // 0x00 separator between label and context
         fixedInput.writeBytes(context); // context
-        fixedInput.writeBytes(new byte[] { 0x00, 0x00, 0x00, (byte) 0x80 }); // L = 128 (4-byte BE)
+        final int lBits = keyLength * 8;
+        fixedInput.writeBytes(new byte[] { 0x00, 0x00, (byte) (lBits >> 8), (byte) lBits }); // L (4-byte BE)
 
         final Mac mac = Mac.getInstance("HmacSHA256");
         mac.init(new SecretKeySpec(sessionKey, "HmacSHA256"));
         final byte[] full = mac.doFinal(fixedInput.toByteArray());
-        return Arrays.copyOf(full, 16);
+        return Arrays.copyOf(full, keyLength);
     }
 
     private static byte[] fixedSessionKey() {
@@ -465,6 +471,28 @@ class Smb3KeyDerivationTest {
         final byte[] preauth = new byte[64];
         Arrays.fill(preauth, (byte) 0x02);
         return preauth;
+    }
+
+    @Test
+    @DisplayName("Derives 32-byte AES-256 cipher keys with L=256 encoded in the KDF input")
+    void testAes256KeyDerivation() throws Exception {
+        final byte[] sk = fixedSessionKey();
+        final byte[] preauth = fixedPreauth();
+
+        final byte[] encActual = Smb3KeyDerivation.deriveEncryptionKey(Smb2Constants.SMB2_DIALECT_0311, sk, preauth, 32);
+        assertEquals(32, encActual.length, "AES-256 needs a 32-byte key");
+        assertArrayEquals(deriveOracle("SMBC2SCipherKey", preauth, sk, 32), encActual,
+                "32-byte encryption key must match the SP800-108 oracle with L=256");
+
+        final byte[] decActual = Smb3KeyDerivation.deriveDecryptionKey(Smb2Constants.SMB2_DIALECT_0311, sk, preauth, 32);
+        assertEquals(32, decActual.length);
+        assertArrayEquals(deriveOracle("SMBS2CCipherKey", preauth, sk, 32), decActual,
+                "32-byte decryption key must match the SP800-108 oracle with L=256");
+
+        // L is part of the fixed KDF input, so a 32-byte derivation is not just
+        // an extension of the 16-byte one
+        final byte[] enc16 = Smb3KeyDerivation.deriveEncryptionKey(Smb2Constants.SMB2_DIALECT_0311, sk, preauth);
+        assertFalse(Arrays.equals(enc16, Arrays.copyOf(encActual, 16)), "Different L must give a different key stream");
     }
 
     @Test
