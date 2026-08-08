@@ -425,6 +425,30 @@ class SmbTransportImplTest {
             assertEquals(EncryptionNegotiateContext.CIPHER_AES128_GCM, gcm.getCipherId());
             assertEquals(DialectVersion.SMB311, gcm.getDialect());
         }
+
+        @Test
+        @DisplayName("encryptionContextFor resolves a registered session's context by session ID")
+        void encryptionContextLookup() {
+            SmbSessionImpl sess = mock(SmbSessionImpl.class);
+            Smb2EncryptionContext ectx = new Smb2EncryptionContext(EncryptionNegotiateContext.CIPHER_AES128_GCM, DialectVersion.SMB311,
+                    new byte[16], new byte[16]);
+            when(sess.getEncryptionContext()).thenReturn(ectx);
+
+            transport.registerSession(7L, sess);
+            assertSame(ectx, transport.encryptionContextFor(7L));
+            assertNull(transport.encryptionContextFor(8L), "Unknown session IDs must resolve to null");
+
+            transport.unregisterSession(7L);
+            assertNull(transport.encryptionContextFor(7L), "Unregistered sessions must resolve to null");
+        }
+
+        @Test
+        @DisplayName("session ID zero is never registered")
+        void sessionIdZeroNotRegistered() {
+            SmbSessionImpl sess = mock(SmbSessionImpl.class);
+            transport.registerSession(0L, sess);
+            assertNull(transport.encryptionContextFor(0L), "Session ID 0 (not yet established) must not be registered");
+        }
     }
 
     @Test

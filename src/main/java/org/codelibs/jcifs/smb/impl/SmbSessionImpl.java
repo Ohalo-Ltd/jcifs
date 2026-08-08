@@ -1139,6 +1139,7 @@ final class SmbSessionImpl implements SmbSessionInternal {
         } finally {
             this.connectionState.set(0);
             this.digest = null;
+            this.transport.unregisterSession(this.sessionId);
             this.transport.notifyAll();
         }
         return wasInUse;
@@ -1159,6 +1160,7 @@ final class SmbSessionImpl implements SmbSessionInternal {
         this.extendedSecurity = true;
         this.connectionState.set(2);
         this.sessionId = response.getSessionId();
+        this.transport.registerSession(this.sessionId, this);
     }
 
     void setSessionSetup(SmbComSessionSetupAndXResponse response) {
