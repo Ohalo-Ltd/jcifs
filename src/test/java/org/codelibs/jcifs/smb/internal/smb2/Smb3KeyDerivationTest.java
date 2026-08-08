@@ -480,6 +480,66 @@ class Smb3KeyDerivationTest {
         assertArrayEquals(expected, oracle, "In-test SP800-108 oracle must faithfully reproduce the production KDF");
     }
 
+    private static byte[] hex(final String s) {
+        final byte[] out = new byte[s.length() / 2];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = (byte) Integer.parseInt(s.substring(2 * i, 2 * i + 2), 16);
+        }
+        return out;
+    }
+
+    /**
+     * Known-answer test against the published SMB 3.1.1 vectors from the
+     * Microsoft Open Specifications article "SMB 2 and SMB 3 security in
+     * Windows 10: the anatomy of signing and cryptographic keys" (key
+     * derivation example for SMB 3.1.1 multichannel, master session).
+     */
+    @Test
+    @DisplayName("Matches the published SMB 3.1.1 key derivation vectors")
+    void testPublishedVectors311() {
+        final byte[] sk = hex("270E1BA896585EEB7AF3472D3B4C75A7");
+        final byte[] preauth = hex("0DD13628CC3ED218EF9DF9772D436D0887AB9814BFAE63A80AA845F36909DB79"
+                + "28622DDDAD522D9751640A459762C5A9D6BB084CBB3CE6BDADEF5D5BCE3C6C01");
+
+        assertArrayEquals(hex("73FE7A9A77BEF0BDE49C650D8CCB5F76"),
+                Smb3KeyDerivation.deriveSigningKey(Smb2Constants.SMB2_DIALECT_0311, sk, preauth),
+                "SMB 3.1.1 SigningKey must match the published vector");
+        assertArrayEquals(hex("629BCBC54422A0F572B97F45989B6073"),
+                Smb3KeyDerivation.deriveEncryptionKey(Smb2Constants.SMB2_DIALECT_0311, sk, preauth),
+                "SMB 3.1.1 EncryptionKey (client-to-server) must match the published vector");
+        assertArrayEquals(hex("E2AF0DCEFAC68DA71A0DFBD0D1350D74"),
+                Smb3KeyDerivation.deriveDecryptionKey(Smb2Constants.SMB2_DIALECT_0311, sk, preauth),
+                "SMB 3.1.1 DecryptionKey (server-to-client) must match the published vector");
+        assertArrayEquals(hex("6D7AD7954E9EC61E907B4D473DC178FF"),
+                Smb3KeyDerivation.dervieApplicationKey(Smb2Constants.SMB2_DIALECT_0311, sk, preauth),
+                "SMB 3.1.1 ApplicationKey must match the published vector");
+    }
+
+    /**
+     * Known-answer test against the published SMB 3.0 vectors from the same
+     * article (key derivation example for SMB 3.0 multichannel, master
+     * session). SMB 3.0.x uses fixed label/context pairs instead of the
+     * preauth integrity hash.
+     */
+    @Test
+    @DisplayName("Matches the published SMB 3.0 key derivation vectors")
+    void testPublishedVectors300() {
+        final byte[] sk = hex("7CD451825D0450D235424E44BA6E78CC");
+
+        assertArrayEquals(hex("0B7E9C5CAC36C0F6EA9AB275298CEDCE"),
+                Smb3KeyDerivation.deriveSigningKey(Smb2Constants.SMB2_DIALECT_0300, sk, null),
+                "SMB 3.0 SigningKey must match the published vector");
+        assertArrayEquals(hex("FAD27796665B313EBB578F388632B4F7"),
+                Smb3KeyDerivation.deriveEncryptionKey(Smb2Constants.SMB2_DIALECT_0300, sk, null),
+                "SMB 3.0 EncryptionKey (ServerIn ) must match the published vector");
+        assertArrayEquals(hex("B0F0427F7CEB416D1D9DCC0CD4F99447"),
+                Smb3KeyDerivation.deriveDecryptionKey(Smb2Constants.SMB2_DIALECT_0300, sk, null),
+                "SMB 3.0 DecryptionKey (ServerOut) must match the published vector");
+        assertArrayEquals(hex("BB23A4575AA26C721AF525AF15A87B4F"),
+                Smb3KeyDerivation.dervieApplicationKey(Smb2Constants.SMB2_DIALECT_0300, sk, null),
+                "SMB 3.0 ApplicationKey must match the published vector");
+    }
+
     @Test
     @DisplayName("SMB 3.1.1 cipher keys must use SMBC2SCipherKey / SMBS2CCipherKey labels")
     void testCipherKeyLabelsArePinned() throws Exception {

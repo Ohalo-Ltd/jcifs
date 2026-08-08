@@ -387,6 +387,21 @@ class SmbTransportImplTest {
         }
 
         @Test
+        @DisplayName("createEncryptionContext rejects a null or empty session key with a clear error")
+        void createEncryptionContext_rejects_missingSessionKey() throws Exception {
+            setField(transport, "smb2", true);
+            Smb2NegotiateResponse nego = new Smb2NegotiateResponse(cfg);
+            setField(nego, "selectedDialect", DialectVersion.SMB311);
+            setField(transport, "negotiated", nego);
+
+            // e.g. anonymous sessions have no session key; the failure must be an
+            // SmbUnsupportedOperationException, not the KDF's IllegalArgumentException
+            // ("A KDF requires Ki (a seed) as input", refs codelibs/jcifs#70)
+            assertThrows(SmbUnsupportedOperationException.class, () -> transport.createEncryptionContext(null, new byte[64]));
+            assertThrows(SmbUnsupportedOperationException.class, () -> transport.createEncryptionContext(new byte[0], new byte[64]));
+        }
+
+        @Test
         @DisplayName("createEncryptionContext selects AES-CCM for SMB 3.0 and AES-GCM for SMB 3.1.1")
         void createEncryptionContext_happyDialects() throws Exception {
             byte[] sessionKey = new byte[16];
