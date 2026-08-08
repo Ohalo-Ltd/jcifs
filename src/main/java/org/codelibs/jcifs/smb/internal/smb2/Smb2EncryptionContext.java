@@ -189,9 +189,10 @@ public class Smb2EncryptionContext {
      *             if decryption fails
      */
     public byte[] decryptMessage(final byte[] encryptedMessage) throws CIFSException {
+        // Parse transform header
+        final Smb2TransformHeader transformHeader = Smb2TransformHeader.decode(encryptedMessage, 0);
+        checkTransformFlags(transformHeader.getFlags());
         try {
-            // Parse transform header
-            final Smb2TransformHeader transformHeader = Smb2TransformHeader.decode(encryptedMessage, 0);
             final byte[] associatedData = transformHeader.getAssociatedData();
             // only the cipher's nonce length is used, the rest of the 16-byte
             // field is padding to be ignored on receipt (MS-SMB2 2.2.41)
@@ -214,6 +215,26 @@ public class Smb2EncryptionContext {
             return cipher.doFinal(input);
         } catch (final Exception e) {
             throw new CIFSException("Failed to decrypt message", e);
+        }
+    }
+
+    /**
+     * Validate the Flags/EncryptionAlgorithm field of a received transform
+     * header against the negotiated cipher, per MS-SMB2 3.2.5.1.1.1: for
+     * SMB 3.1.1 the field must be exactly 0x0001 (Encrypted), for SMB 3.0.x it
+     * must equal the negotiated encryption algorithm.
+     *
+     * @param flags received Flags/EncryptionAlgorithm value
+     * @throws CIFSException if the message must be discarded
+     */
+    private void checkTransformFlags(final int flags) throws CIFSException {
+        if (this.dialect.atLeast(DialectVersion.SMB311)) {
+            if (flags != TRANSFORM_FLAG_ENCRYPTED) {
+                throw new CIFSException("Invalid transform header flags 0x" + Integer.toHexString(flags));
+            }
+        } else if (flags != this.cipherId) {
+            throw new CIFSException(
+                    "Transform header encryption algorithm 0x" + Integer.toHexString(flags) + " does not match the negotiated cipher");
         }
     }
 

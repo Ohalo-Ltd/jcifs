@@ -565,6 +565,161 @@ class SmbTransportImplTest {
         }
     }
 
+    @Nested
+    @DisplayName("Encrypted receive path")
+    class EncryptedReceive {
+
+        private static final long SESSION_ID = 0x55667788L;
+
+        private Smb2EncryptionContext serverCtx;
+
+        @BeforeEach
+        void setUpEncryptedTransport() {
+            setField(transport, "smb2", true);
+            setField(transport, "negotiated", new Smb2NegotiateResponse(cfg));
+            when(cfg.getMaximumBufferSize()).thenReturn(0x10000);
+            when(ctx.getBufferCache()).thenReturn(new BufferCacheImpl(8, 0x10000 + 128));
+
+            byte[] k1 = new byte[16];
+            byte[] k2 = new byte[16];
+            java.util.Arrays.fill(k1, (byte) 3);
+            java.util.Arrays.fill(k2, (byte) 4);
+            Smb2EncryptionContext clientCtx =
+                    new Smb2EncryptionContext(EncryptionNegotiateContext.CIPHER_AES128_GCM, DialectVersion.SMB311, k1, k2);
+            // the server encrypts server-to-client traffic with the client's decryption key
+            serverCtx = new Smb2EncryptionContext(EncryptionNegotiateContext.CIPHER_AES128_GCM, DialectVersion.SMB311, k2, k1);
+
+            SmbSessionImpl sess = mock(SmbSessionImpl.class);
+            when(sess.getEncryptionContext()).thenReturn(clientCtx);
+            transport.registerSession(SESSION_ID, sess);
+        }
+
+        /**
+         * Hand-crafts a plaintext SMB2 ECHO response message.
+         *
+         * @param mid message ID
+         * @param nextCommandOffset compound offset of the next message, 0 for the last
+         * @return encoded message (68 bytes, or nextCommandOffset with padding)
+         */
+        private byte[] plainEchoResponse(long mid, int nextCommandOffset) {
+            byte[] msg = new byte[nextCommandOffset > 0 ? nextCommandOffset : 68];
+            System.arraycopy(org.codelibs.jcifs.smb.internal.util.SMBUtil.SMB2_HEADER, 0, msg, 0, 64);
+            org.codelibs.jcifs.smb.internal.util.SMBUtil.writeInt2(0x0D, msg, 12); // ECHO
+            org.codelibs.jcifs.smb.internal.util.SMBUtil
+                    .writeInt4(org.codelibs.jcifs.smb.internal.smb2.ServerMessageBlock2.SMB2_FLAGS_SERVER_TO_REDIR, msg, 16);
+            org.codelibs.jcifs.smb.internal.util.SMBUtil.writeInt4(nextCommandOffset, msg, 20);
+            org.codelibs.jcifs.smb.internal.util.SMBUtil.writeInt8(mid, msg, 24);
+            org.codelibs.jcifs.smb.internal.util.SMBUtil.writeInt8(SESSION_ID, msg, 40);
+            org.codelibs.jcifs.smb.internal.util.SMBUtil.writeInt2(4, msg, 64); // echo response structure size
+            return msg;
+        }
+
+        /** Wraps a plaintext message into an NBSS-framed encrypted wire frame. */
+        private byte[] encryptedWire(byte[] plain, long sessionId) throws Exception {
+            byte[] frame = serverCtx.encryptMessage(plain, sessionId);
+            byte[] wire = new byte[4 + frame.length];
+            wire[1] = (byte) (frame.length >> 16 & 0xFF);
+            wire[2] = (byte) (frame.length >> 8 & 0xFF);
+            wire[3] = (byte) (frame.length & 0xFF);
+            System.arraycopy(frame, 0, wire, 4, frame.length);
+            return wire;
+        }
+
+        private void feed(byte[]... wires) {
+            java.io.ByteArrayOutputStream all = new java.io.ByteArrayOutputStream();
+            for (byte[] w : wires) {
+                all.writeBytes(w);
+            }
+            setField(transport, "in", new java.io.ByteArrayInputStream(all.toByteArray()));
+        }
+
+        @Test
+        @DisplayName("peekKey decrypts a transform frame and returns the inner MessageId")
+        void peekKey_decrypts() throws Exception {
+            feed(encryptedWire(plainEchoResponse(42L, 0), SESSION_ID));
+
+            Long key = transport.peekKey();
+
+            assertEquals(42L, key, "The MessageId must come from the decrypted header");
+
+            org.codelibs.jcifs.smb.internal.smb2.Smb2EchoResponse resp = new org.codelibs.jcifs.smb.internal.smb2.Smb2EchoResponse(cfg);
+            transport.doRecv(resp);
+            assertTrue(resp.isReceived(), "The response must decode from the buffered plaintext");
+            assertNull(getField(transport, "pendingPlaintext"), "The buffered plaintext must be cleared after receive");
+        }
+
+        @Test
+        @DisplayName("a compound response decodes entirely from one decrypted blob")
+        void doRecv_compoundFromPlaintext() throws Exception {
+            byte[] first = plainEchoResponse(50L, 72); // 68 bytes padded to the 8-byte boundary
+            byte[] second = plainEchoResponse(51L, 0);
+            byte[] plain = new byte[first.length + second.length];
+            System.arraycopy(first, 0, plain, 0, first.length);
+            System.arraycopy(second, 0, plain, first.length, second.length);
+            feed(encryptedWire(plain, SESSION_ID));
+
+            assertEquals(50L, transport.peekKey());
+
+            org.codelibs.jcifs.smb.internal.smb2.Smb2EchoResponse r1 = new org.codelibs.jcifs.smb.internal.smb2.Smb2EchoResponse(cfg);
+            org.codelibs.jcifs.smb.internal.smb2.Smb2EchoResponse r2 = new org.codelibs.jcifs.smb.internal.smb2.Smb2EchoResponse(cfg);
+            setField(r1, "next", r2);
+            transport.doRecv(r1);
+
+            assertTrue(r1.isReceived(), "First compound response must decode");
+            assertTrue(r2.isReceived(), "Chained compound response must decode from the same plaintext blob");
+        }
+
+        @Test
+        @DisplayName("a corrupted auth tag fails loudly instead of surfacing a message")
+        void peekKey_rejectsCorruptedFrame() throws Exception {
+            byte[] wire = encryptedWire(plainEchoResponse(42L, 0), SESSION_ID);
+            wire[4 + 4] ^= (byte) 0xFF; // flip a signature byte
+            feed(wire);
+
+            assertThrows(java.io.IOException.class, () -> transport.peekKey(), "An unauthentic frame must raise");
+        }
+
+        @Test
+        @DisplayName("an unknown session ID fails loudly")
+        void peekKey_rejectsUnknownSession() throws Exception {
+            feed(encryptedWire(plainEchoResponse(42L, 0), 0x424242L));
+
+            assertThrows(java.io.IOException.class, () -> transport.peekKey(),
+                    "Encrypted frames for unknown sessions must raise, not fall back to cleartext");
+        }
+
+        @Test
+        @DisplayName("an OriginalMessageSize not matching the frame fails loudly")
+        void peekKey_rejectsSizeMismatch() throws Exception {
+            byte[] wire = encryptedWire(plainEchoResponse(42L, 0), SESSION_ID);
+            // patch the OriginalMessageSize field (frame offset 36)
+            org.codelibs.jcifs.smb.internal.util.SMBUtil.writeInt4(9999, wire, 4 + 36);
+            feed(wire);
+
+            assertThrows(java.io.IOException.class, () -> transport.peekKey(),
+                    "MS-SMB2 3.2.5.1.1.1 requires discarding frames whose size does not match");
+        }
+
+        @Test
+        @DisplayName("doSkip discards an unmatched decrypted frame without desynchronizing the stream")
+        void doSkip_discardsBufferedPlaintext() throws Exception {
+            byte[] encrypted = encryptedWire(plainEchoResponse(77L, 0), SESSION_ID);
+            // followed by a cleartext frame that must still parse correctly
+            byte[] clearMsg = plainEchoResponse(78L, 0);
+            byte[] clearWire = new byte[4 + clearMsg.length];
+            clearWire[2] = (byte) (clearMsg.length >> 8 & 0xFF);
+            clearWire[3] = (byte) (clearMsg.length & 0xFF);
+            System.arraycopy(clearMsg, 0, clearWire, 4, clearMsg.length);
+            feed(encrypted, clearWire);
+
+            assertEquals(77L, transport.peekKey());
+            transport.doSkip(77L);
+            assertNull(getField(transport, "pendingPlaintext"), "Skipping must drop the buffered plaintext");
+
+            assertEquals(78L, transport.peekKey(), "The following cleartext frame must still be readable");
+        }
+    }
+
     @Test
     @DisplayName("getRequestSecurityMode honors enforced and server-required flags")
     void requestSecurityMode() {
