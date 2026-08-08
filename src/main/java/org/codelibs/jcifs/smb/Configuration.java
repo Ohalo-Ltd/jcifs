@@ -511,6 +511,19 @@ public interface Configuration {
     boolean isEncryptionRequired();
 
     /**
+     * Property {@code org.codelibs.jcifs.smb.impl.client.encryptionCiphers} (comma-separated
+     * cipher names, default {@code AES-256-GCM,AES-128-GCM,AES-256-CCM,AES-128-CCM})
+     *
+     * The encryption ciphers offered in SMB 3.1.1 negotiation, most preferred
+     * first. Narrow the list to restrict connections to specific ciphers,
+     * e.g. {@code AES-256-GCM} only. SMB 3.0.x supports only AES-128-CCM;
+     * removing it from this list disables encryption for those dialects.
+     *
+     * @return MS-SMB2 encryption cipher identifiers in preference order
+     */
+    int[] getEncryptionCiphers();
+
+    /**
      *
      * Property {@code org.codelibs.jcifs.smb.impl.client.forceExtendedSecurity} (boolean, default false)
      *

@@ -2011,8 +2011,23 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
                 cipherId = EncryptionNegotiateContext.CIPHER_AES128_GCM;
             }
         } else if (dialect.atLeast(DialectVersion.SMB300)) {
-            // SMB 3.0/3.0.2 only supports AES-128-CCM
+            // SMB 3.0/3.0.2 only supports AES-128-CCM; honour a configured
+            // narrowing of the allowed ciphers
             cipherId = EncryptionNegotiateContext.CIPHER_AES128_CCM;
+            final int[] allowedCiphers = getContext().getConfig().getEncryptionCiphers();
+            if (allowedCiphers != null) {
+                boolean allowed = false;
+                for (final int c : allowedCiphers) {
+                    if (c == cipherId) {
+                        allowed = true;
+                        break;
+                    }
+                }
+                if (!allowed) {
+                    throw new SmbUnsupportedOperationException(
+                            "AES-128-CCM is disabled by configuration but is the only cipher available for " + dialect);
+                }
+            }
         } else {
             throw new SmbUnsupportedOperationException("SMB3 required for encryption, negotiated: " + dialect);
         }

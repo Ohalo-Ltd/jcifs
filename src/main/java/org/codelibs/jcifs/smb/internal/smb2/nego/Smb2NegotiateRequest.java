@@ -88,8 +88,13 @@ public class Smb2NegotiateRequest extends ServerMessageBlock2Request<Smb2Negotia
             this.preauthSalt = salt;
 
             if (config.isEncryptionEnabled() || config.isEncryptionRequired()) {
-                negoContexts.add(new EncryptionNegotiateContext(config,
-                        new int[] { EncryptionNegotiateContext.CIPHER_AES128_GCM, EncryptionNegotiateContext.CIPHER_AES128_CCM }));
+                int[] ciphers = config.getEncryptionCiphers();
+                if (ciphers == null || ciphers.length == 0) {
+                    // MS-SMB2 2.2.3.1.2 preference order
+                    ciphers = new int[] { EncryptionNegotiateContext.CIPHER_AES256_GCM, EncryptionNegotiateContext.CIPHER_AES128_GCM,
+                            EncryptionNegotiateContext.CIPHER_AES256_CCM, EncryptionNegotiateContext.CIPHER_AES128_CCM };
+                }
+                negoContexts.add(new EncryptionNegotiateContext(config, ciphers));
             }
         }
 
