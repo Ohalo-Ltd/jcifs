@@ -414,7 +414,16 @@ class SmbTreeImpl implements SmbTreeInternal {
             // this does not make any sense if we are disconnecting right now
             T chainedResponse = null;
             if (!(request instanceof SmbComTreeDisconnect) && !(request instanceof Smb2TreeDisconnectRequest)) {
-                chainedResponse = treeConnect(request, response);
+                if (sess.getEncryptionContext() != null && sess.getEncryptionContextFor(0) == null) {
+                    // encryption is available but not required at the session level:
+                    // whether this request must be encrypted depends on the share's
+                    // SMB2_SHAREFLAG_ENCRYPT_DATA, which is only known once the tree
+                    // connect response arrives - do not chain the payload onto the
+                    // tree connect, send it separately afterwards
+                    treeConnect(null, null);
+                } else {
+                    chainedResponse = treeConnect(request, response);
+                }
             }
             if (request == null || chainedResponse != null && chainedResponse.isReceived()) {
                 return chainedResponse;

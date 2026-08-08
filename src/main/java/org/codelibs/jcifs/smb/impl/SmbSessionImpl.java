@@ -631,20 +631,32 @@ final class SmbSessionImpl implements SmbSessionInternal {
                     log.debug("No digest setup " + anonymous + " B " + isSignatureSetupRequired());
                 }
 
-                if (this.encryptData) {
-                    // Derive the encryption context only now: the session key is set
+                if (negoResp.isEncryptionSupported()) {
+                    // Derive the encryption context whenever a cipher was negotiated,
+                    // not only when the session flag demands it: a server may omit
+                    // SMB2_SESSION_FLAG_ENCRYPT_DATA and still require encryption at
+                    // the share level (SMB2_SHAREFLAG_ENCRYPT_DATA on tree connect),
+                    // and the keys can only be derived here - the session key is set
                     // and, for SMB 3.1.1, the preauth integrity hash is final (it
                     // includes the last session setup request but per spec not the
-                    // final response)
+                    // final response). Deriving is cheap; not having the keys when a
+                    // requirement surfaces is the bug.
                     try {
                         this.encryptionContext = trans.createEncryptionContext(this.sessionKey, this.preauthIntegrityHash);
                         if (log.isDebugEnabled()) {
                             log.debug("Created encryption context, cipher " + this.encryptionContext.getCipherId());
                         }
                     } catch (CIFSException e) {
-                        log.error("Failed to create encryption context", e);
-                        throw new SmbAuthException("Failed to setup required encryption", e);
+                        if (this.encryptData) {
+                            log.error("Failed to create encryption context", e);
+                            throw new SmbAuthException("Failed to setup required encryption", e);
+                        }
+                        // e.g. anonymous/guest sessions have no session key; encrypted
+                        // operation is simply not available on this session
+                        log.debug("Failed to create encryption context, encryption will not be available", e);
                     }
+                } else if (this.encryptData) {
+                    throw new SmbAuthException("Server requires encryption but encryption was not negotiated");
                 }
 
                 setSessionSetup(response);
