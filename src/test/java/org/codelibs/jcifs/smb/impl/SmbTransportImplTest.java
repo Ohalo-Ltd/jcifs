@@ -427,6 +427,25 @@ class SmbTransportImplTest {
         }
 
         @Test
+        @DisplayName("createEncryptionContext honours a cipher narrowing that excludes AES-128-CCM on SMB 3.0")
+        void createEncryptionContext_respectsCipherNarrowing() throws Exception {
+            setField(transport, "smb2", true);
+            Smb2NegotiateResponse smb300 = new Smb2NegotiateResponse(cfg);
+            setField(smb300, "selectedDialect", DialectVersion.SMB300);
+            setField(transport, "negotiated", smb300);
+
+            // SMB 3.0 only supports AES-128-CCM - narrowing it away must fail
+            // clearly instead of encrypting with a disallowed cipher
+            when(cfg.getEncryptionCiphers()).thenReturn(new int[] { EncryptionNegotiateContext.CIPHER_AES256_GCM });
+            assertThrows(SmbUnsupportedOperationException.class, () -> transport.createEncryptionContext(new byte[16], null));
+
+            // with AES-128-CCM allowed it works
+            when(cfg.getEncryptionCiphers())
+                    .thenReturn(new int[] { EncryptionNegotiateContext.CIPHER_AES256_GCM, EncryptionNegotiateContext.CIPHER_AES128_CCM });
+            assertEquals(EncryptionNegotiateContext.CIPHER_AES128_CCM, transport.createEncryptionContext(new byte[16], null).getCipherId());
+        }
+
+        @Test
         @DisplayName("createEncryptionContext derives 32-byte keys for a negotiated AES-256 cipher")
         void createEncryptionContext_aes256() throws Exception {
             byte[] sessionKey = new byte[16];

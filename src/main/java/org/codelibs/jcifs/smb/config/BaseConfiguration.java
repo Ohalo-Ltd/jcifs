@@ -26,6 +26,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.StringTokenizer;
@@ -78,6 +79,8 @@ public class BaseConfiguration implements Configuration {
     protected boolean encryptionEnabled = false;
     /** Whether SMB3 encryption is required, failing connections that cannot encrypt */
     protected boolean encryptionRequired = false;
+    /** Encryption ciphers offered in SMB 3.1.1 negotiation, most preferred first (MS-SMB2 cipher IDs) */
+    protected int[] encryptionCiphers;
     /** Whether to use NT status codes instead of DOS error codes */
     protected boolean useNtStatus = true;
     /** Whether to use extended security negotiation */
@@ -565,6 +568,39 @@ public class BaseConfiguration implements Configuration {
     }
 
     @Override
+    public int[] getEncryptionCiphers() {
+        return this.encryptionCiphers;
+    }
+
+    /**
+     * Parse a comma-separated list of encryption cipher names into MS-SMB2
+     * cipher identifiers, most preferred first.
+     *
+     * @param cipherNames comma-separated cipher names, or null/blank for the
+     *            default preference order per MS-SMB2 2.2.3.1.2
+     * @throws CIFSException on an unknown cipher name
+     */
+    protected void initEncryptionCiphers(final String cipherNames) throws CIFSException {
+        if (cipherNames == null || cipherNames.isBlank()) {
+            this.encryptionCiphers =
+                    new int[] { 0x04 /* AES-256-GCM */, 0x02 /* AES-128-GCM */, 0x03 /* AES-256-CCM */, 0x01 /* AES-128-CCM */ };
+            return;
+        }
+        final String[] names = cipherNames.split(",");
+        final int[] ids = new int[names.length];
+        for (int i = 0; i < names.length; i++) {
+            ids[i] = switch (names[i].trim().toUpperCase(Locale.ROOT).replace('_', '-')) {
+            case "AES-128-CCM" -> 0x01;
+            case "AES-128-GCM" -> 0x02;
+            case "AES-256-CCM" -> 0x03;
+            case "AES-256-GCM" -> 0x04;
+            default -> throw new CIFSException("Unknown encryption cipher " + names[i].trim());
+            };
+        }
+        this.encryptionCiphers = ids;
+    }
+
+    @Override
     public boolean isForceExtendedSecurity() {
         return this.forceExtendedSecurity;
     }
@@ -805,6 +841,10 @@ public class BaseConfiguration implements Configuration {
             final byte[] mid = new byte[32];
             this.random.nextBytes(mid);
             this.machineId = mid;
+        }
+
+        if (this.encryptionCiphers == null) {
+            initEncryptionCiphers(null);
         }
 
         if (this.nativeOs == null) {
