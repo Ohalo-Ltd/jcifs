@@ -35,7 +35,9 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -116,6 +118,13 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
     private final byte[] sbuf = new byte[1024]; /* small local buffer */
     private long sessionExpiration;
     private final List<SmbSessionImpl> sessions = new LinkedList<>();
+    /**
+     * Sessions by server-assigned session ID, for looking up the encryption
+     * context of a frame on the send and receive paths. Concurrent map because
+     * lookups happen on the transport thread while registration happens from
+     * session-setup callers; never a linear scan on the per-frame hot path.
+     */
+    private final Map<Long, SmbSessionImpl> sessionsById = new ConcurrentHashMap<>();
 
     private String tconHostName = null;
 
@@ -377,6 +386,42 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
         }
         this.sessions.add(ssn);
         return ssn;
+    }
+
+    /**
+     * Register a session under its server-assigned session ID, making its
+     * encryption context discoverable by {@link #encryptionContextFor(long)}.
+     *
+     * @param sessionId server-assigned session ID
+     * @param session the session
+     */
+    void registerSession(final long sessionId, final SmbSessionImpl session) {
+        if (sessionId != 0) {
+            this.sessionsById.put(sessionId, session);
+        }
+    }
+
+    /**
+     * Remove a session from the session-ID map, e.g. on logoff.
+     *
+     * @param sessionId server-assigned session ID
+     */
+    void unregisterSession(final long sessionId) {
+        if (sessionId != 0) {
+            this.sessionsById.remove(sessionId);
+        }
+    }
+
+    /**
+     * Look up the encryption context for a session ID.
+     *
+     * @param sessionId server-assigned session ID
+     * @return the session's encryption context, or null if the session is
+     *         unknown or has no encryption context
+     */
+    Smb2EncryptionContext encryptionContextFor(final long sessionId) {
+        final SmbSessionImpl sess = this.sessionsById.get(sessionId);
+        return sess != null ? sess.getEncryptionContext() : null;
     }
 
     boolean matches(final Address addr, final int prt, final InetAddress laddr, final int lprt, String hostName) {
@@ -754,6 +799,7 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
             this.socket = null;
             this.digest = null;
             this.tconHostName = null;
+            this.sessionsById.clear();
             this.transportContext.getTransportPool().removeTransport(this);
         }
         return wasInUse;
