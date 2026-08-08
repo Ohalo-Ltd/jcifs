@@ -18,6 +18,7 @@
 package org.codelibs.jcifs.smb.internal.smb2;
 
 import java.security.SecureRandom;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLong;
 
 import javax.crypto.Cipher;
@@ -101,21 +102,35 @@ public class Smb2EncryptionContext {
     }
 
     /**
+     * Get the nonce length used by the negotiated cipher.
+     *
+     * Per MS-SMB2 2.2.41 the transform header carries a 16-byte nonce field,
+     * but only the cipher's nonce length is significant: 11 bytes for AES-CCM
+     * and 12 bytes for AES-GCM. The remainder of the field must be zero.
+     *
+     * @return the cipher nonce length in bytes
+     */
+    public int getNonceLength() {
+        return isGCMCipher() ? 12 : 11;
+    }
+
+    /**
      * Generate a unique nonce for encryption
      *
-     * @return 16-byte nonce
+     * @return nonce of the cipher's nonce length (see {@link #getNonceLength()})
      */
     public byte[] generateNonce() {
-        final byte[] nonce = new byte[16];
+        final byte[] nonce = new byte[getNonceLength()];
 
-        // Use combination of counter and random data for uniqueness
+        // Use combination of counter and random data for uniqueness; the counter
+        // alone already guarantees no reuse within this context's lifetime
         final long counter = this.nonceCounter.incrementAndGet();
         System.arraycopy(longToBytes(counter), 0, nonce, 0, 8);
 
-        // Fill remaining 8 bytes with random data
-        final byte[] randomBytes = new byte[8];
+        // Fill the remaining bytes with random data
+        final byte[] randomBytes = new byte[nonce.length - 8];
         this.secureRandom.nextBytes(randomBytes);
-        System.arraycopy(randomBytes, 0, nonce, 8, 8);
+        System.arraycopy(randomBytes, 0, nonce, 8, randomBytes.length);
 
         return nonce;
     }
@@ -136,7 +151,9 @@ public class Smb2EncryptionContext {
             final byte[] nonce = generateNonce();
             final int flags = getTransformFlags();
 
-            final Smb2TransformHeader transformHeader = new Smb2TransformHeader(nonce, message.length, flags, sessionId);
+            // the transform header nonce field is 16 bytes, zero-padded beyond the
+            // cipher's nonce length (MS-SMB2 2.2.41)
+            final Smb2TransformHeader transformHeader = new Smb2TransformHeader(Arrays.copyOf(nonce, 16), message.length, flags, sessionId);
             final byte[] associatedData = transformHeader.getAssociatedData();
 
             byte[] ciphertext;
@@ -202,7 +219,9 @@ public class Smb2EncryptionContext {
             // Parse transform header
             final Smb2TransformHeader transformHeader = Smb2TransformHeader.decode(encryptedMessage, 0);
             final byte[] associatedData = transformHeader.getAssociatedData();
-            final byte[] nonce = transformHeader.getNonce();
+            // only the cipher's nonce length is used, the rest of the 16-byte
+            // field is padding to be ignored on receipt (MS-SMB2 2.2.41)
+            final byte[] nonce = Arrays.copyOf(transformHeader.getNonce(), getNonceLength());
             final byte[] authTag = transformHeader.getSignature();
 
             // Extract ciphertext
@@ -285,11 +304,7 @@ public class Smb2EncryptionContext {
         final AEADBlockCipher cipher = new CCMBlockCipher(new AESEngine());
 
         final KeyParameter keyParam = new KeyParameter(encrypt ? this.encryptionKey : this.decryptionKey);
-        // CCMBlockCipher requires nonce length between 7 and 13
-        final byte[] adjustedNonce = new byte[13];
-        System.arraycopy(nonce, 0, adjustedNonce, 0, Math.min(13, nonce.length));
-
-        final AEADParameters params = new AEADParameters(keyParam, getAuthTagLength() * 8, adjustedNonce, null);
+        final AEADParameters params = new AEADParameters(keyParam, getAuthTagLength() * 8, nonce, null);
 
         cipher.init(encrypt, params);
 

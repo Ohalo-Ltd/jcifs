@@ -174,18 +174,72 @@ class Smb2EncryptionContextTest {
     }
 
     @Test
-    @DisplayName("Should generate unique nonces")
+    @DisplayName("Should generate unique nonces of the cipher nonce length")
     void testGenerateNonce() {
-        // When
+        // When - setUp uses cipher 1 (AES-128-CCM)
         byte[] nonce1 = encryptionContext.generateNonce();
         byte[] nonce2 = encryptionContext.generateNonce();
 
         // Then
         assertNotNull(nonce1, "First nonce should not be null");
         assertNotNull(nonce2, "Second nonce should not be null");
-        assertEquals(16, nonce1.length, "Nonce should be 16 bytes");
-        assertEquals(16, nonce2.length, "Nonce should be 16 bytes");
+        assertEquals(11, nonce1.length, "AES-CCM nonce should be 11 bytes");
+        assertEquals(11, nonce2.length, "AES-CCM nonce should be 11 bytes");
         assertFalse(java.util.Arrays.equals(nonce1, nonce2), "Consecutive nonces should be different");
+    }
+
+    @Test
+    @DisplayName("Should use the MS-SMB2 nonce lengths: 11 bytes for CCM, 12 bytes for GCM")
+    void testNonceLengths() {
+        Smb2EncryptionContext ccm = new Smb2EncryptionContext(Smb2EncryptionContext.CIPHER_AES_128_CCM, DialectVersion.SMB300,
+                testEncryptionKey, testDecryptionKey);
+        Smb2EncryptionContext gcm = new Smb2EncryptionContext(Smb2EncryptionContext.CIPHER_AES_128_GCM, DialectVersion.SMB311,
+                testEncryptionKey, testDecryptionKey);
+
+        assertEquals(11, ccm.getNonceLength(), "AES-CCM uses an 11-byte nonce");
+        assertEquals(12, gcm.getNonceLength(), "AES-GCM uses a 12-byte nonce");
+        assertEquals(11, ccm.generateNonce().length, "Generated CCM nonce should have the cipher nonce length");
+        assertEquals(12, gcm.generateNonce().length, "Generated GCM nonce should have the cipher nonce length");
+    }
+
+    @Test
+    @DisplayName("Should zero-pad the 16-byte transform header nonce field beyond the cipher nonce length")
+    void testTransformHeaderNoncePadding() throws Exception {
+        byte[] message = "nonce padding test".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+        Smb2EncryptionContext ccm = new Smb2EncryptionContext(Smb2EncryptionContext.CIPHER_AES_128_CCM, DialectVersion.SMB300,
+                testEncryptionKey, testDecryptionKey);
+        Smb2TransformHeader ccmHeader = Smb2TransformHeader.decode(ccm.encryptMessage(message, 0x1234L), 0);
+        for (int i = 11; i < 16; i++) {
+            assertEquals(0, ccmHeader.getNonce()[i], "CCM nonce field must be zero-padded from byte 11");
+        }
+
+        Smb2EncryptionContext gcm = new Smb2EncryptionContext(Smb2EncryptionContext.CIPHER_AES_128_GCM, DialectVersion.SMB311,
+                testEncryptionKey, testDecryptionKey);
+        Smb2TransformHeader gcmHeader = Smb2TransformHeader.decode(gcm.encryptMessage(message, 0x1234L), 0);
+        for (int i = 12; i < 16; i++) {
+            assertEquals(0, gcmHeader.getNonce()[i], "GCM nonce field must be zero-padded from byte 12");
+        }
+    }
+
+    @Test
+    @DisplayName("Should round-trip a GCM message between mirrored contexts")
+    void testEncryptDecryptRoundTripGCM() throws Exception {
+        // This only passes if the decrypt side truncates the 16-byte nonce field
+        // to the 12 bytes AES-GCM actually uses - a full-length IV derives a
+        // different J0 and fails authentication.
+        // The AES-CCM round-trip is added once the CCM path moves to JCE.
+        byte[] message = "round trip across the transform header".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+        // the peer's encryption key is our decryption key and vice versa
+        Smb2EncryptionContext sender = new Smb2EncryptionContext(Smb2EncryptionContext.CIPHER_AES_128_GCM, DialectVersion.SMB311,
+                testEncryptionKey, testDecryptionKey);
+        Smb2EncryptionContext receiver = new Smb2EncryptionContext(Smb2EncryptionContext.CIPHER_AES_128_GCM, DialectVersion.SMB311,
+                testDecryptionKey, testEncryptionKey);
+
+        byte[] encrypted = sender.encryptMessage(message, 0xAABBL);
+        byte[] decrypted = receiver.decryptMessage(encrypted);
+        org.junit.jupiter.api.Assertions.assertArrayEquals(message, decrypted, "GCM round-trip should return the plaintext");
     }
 
     @Test
