@@ -262,6 +262,32 @@ class Smb2EncryptionContextTest {
         }
     }
 
+    @Test
+    @DisplayName("Should reject transform header flags that do not match the dialect or cipher")
+    void testTransformFlagsValidation() throws Exception {
+        byte[] message = "flag check".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+        // SMB 3.1.1: the Flags field must be exactly 0x0001 (MS-SMB2 3.2.5.1.1.1)
+        Smb2EncryptionContext sender311 = new Smb2EncryptionContext(Smb2EncryptionContext.CIPHER_AES_128_GCM, DialectVersion.SMB311,
+                testEncryptionKey, testDecryptionKey);
+        Smb2EncryptionContext receiver311 = new Smb2EncryptionContext(Smb2EncryptionContext.CIPHER_AES_128_GCM, DialectVersion.SMB311,
+                testDecryptionKey, testEncryptionKey);
+        byte[] frame311 = sender311.encryptMessage(message, 0x5L);
+        org.codelibs.jcifs.smb.internal.util.SMBUtil.writeInt2(0x0002, frame311, 42); // flags field offset 42
+        org.junit.jupiter.api.Assertions.assertThrows(org.codelibs.jcifs.smb.CIFSException.class,
+                () -> receiver311.decryptMessage(frame311), "SMB 3.1.1 must discard frames whose Flags are not 0x0001");
+
+        // SMB 3.0.x: the EncryptionAlgorithm field must equal the negotiated cipher
+        Smb2EncryptionContext sender300 = new Smb2EncryptionContext(Smb2EncryptionContext.CIPHER_AES_128_CCM, DialectVersion.SMB300,
+                testEncryptionKey, testDecryptionKey);
+        Smb2EncryptionContext receiver300 = new Smb2EncryptionContext(Smb2EncryptionContext.CIPHER_AES_128_CCM, DialectVersion.SMB300,
+                testDecryptionKey, testEncryptionKey);
+        byte[] frame300 = sender300.encryptMessage(message, 0x5L);
+        org.codelibs.jcifs.smb.internal.util.SMBUtil.writeInt2(0x0002, frame300, 42);
+        org.junit.jupiter.api.Assertions.assertThrows(org.codelibs.jcifs.smb.CIFSException.class,
+                () -> receiver300.decryptMessage(frame300), "SMB 3.0.x must discard frames with an unexpected algorithm");
+    }
+
     /**
      * Recomputes the expected transform frame with an independent AES-GCM
      * implementation (the JVM default provider, not the BouncyCastle provider

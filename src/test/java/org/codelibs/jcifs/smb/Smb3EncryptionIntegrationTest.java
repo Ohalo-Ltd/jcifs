@@ -30,7 +30,6 @@ import org.codelibs.jcifs.smb.context.BaseContext;
 import org.codelibs.jcifs.smb.impl.NtlmPasswordAuthenticator;
 import org.codelibs.jcifs.smb.impl.SmbFile;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -52,11 +51,6 @@ import org.testcontainers.utility.DockerImageName;
  * harness whose absence hid the defects tracked in codelibs/jcifs#70 and
  * codelibs/jcifs#71.
  */
-// TODO(enable): remove @Disabled in the commit "feat(smb2): decrypt inbound
-// transform-header frames" - these tests cannot pass until the transport can
-// decrypt inbound 0xFD 'S' 'M' 'B' frames.
-@Disabled("Requires transform-header decryption on the transport receive path;"
-        + " enabled by commit 'feat(smb2): decrypt inbound transform-header frames'")
 @Testcontainers(disabledWithoutDocker = true)
 public class Smb3EncryptionIntegrationTest {
 
