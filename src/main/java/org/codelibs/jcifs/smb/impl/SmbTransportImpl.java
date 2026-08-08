@@ -1727,6 +1727,12 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
             throw new SmbUnsupportedOperationException("SMB2/SMB3 required for encryption");
         }
 
+        if (sessionKey == null || sessionKey.length == 0) {
+            // e.g. anonymous or guest sessions have no session key - surface a clear
+            // error instead of leaking the KDF's IllegalArgumentException (refs codelibs/jcifs#70)
+            throw new SmbUnsupportedOperationException("Session key is not available for encryption key derivation");
+        }
+
         final Smb2NegotiateResponse resp = (Smb2NegotiateResponse) this.negotiated;
         final DialectVersion dialect = resp.getSelectedDialect();
         int cipherId = -1;

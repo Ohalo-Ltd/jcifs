@@ -512,6 +512,8 @@ final class SmbSessionImpl implements SmbSessionInternal {
             log.debug("Initial session preauth hash " + Hexdump.toHexString(this.preauthIntegrityHash));
         }
 
+        boolean encryptData = false;
+
         while (true) {
             Subject s = this.credentials.getSubject();
             if (ctx == null) {
@@ -556,17 +558,13 @@ final class SmbSessionImpl implements SmbSessionInternal {
                 }
 
                 if ((response.getSessionFlags() & Smb2SessionSetupResponse.SMB2_SESSION_FLAG_ENCRYPT_DATA) != 0) {
-                    // Server requires encryption - create encryption context
-                    try {
-                        if (log.isDebugEnabled()) {
-                            log.debug("Server requires encryption, creating encryption context");
-                        }
-                        SmbTransportImpl transport = getTransport();
-                        this.encryptionContext = transport.createEncryptionContext(this.sessionKey, this.preauthIntegrityHash);
-                    } catch (CIFSException e) {
-                        log.error("Failed to create encryption context", e);
-                        throw new SmbAuthException("Failed to setup required encryption", e);
-                    }
+                    // Server requires encryption for this session. Only record the
+                    // requirement here - the encryption context cannot be derived
+                    // yet, as the session key is only available once the security
+                    // context is established and the preauth integrity hash is not
+                    // final before the last session setup leg.
+                    log.debug("Server requires encryption for this session");
+                    encryptData = true;
                 }
 
                 if (preauthIntegrity) {
@@ -622,6 +620,23 @@ final class SmbSessionImpl implements SmbSessionInternal {
                 } else if (log.isDebugEnabled()) {
                     log.debug("No digest setup " + anonymous + " B " + isSignatureSetupRequired());
                 }
+
+                if (encryptData) {
+                    // Derive the encryption context only now: the session key is set
+                    // and, for SMB 3.1.1, the preauth integrity hash is final (it
+                    // includes the last session setup request but per spec not the
+                    // final response)
+                    try {
+                        this.encryptionContext = trans.createEncryptionContext(this.sessionKey, this.preauthIntegrityHash);
+                        if (log.isDebugEnabled()) {
+                            log.debug("Created encryption context, cipher " + this.encryptionContext.getCipherId());
+                        }
+                    } catch (CIFSException e) {
+                        log.error("Failed to create encryption context", e);
+                        throw new SmbAuthException("Failed to setup required encryption", e);
+                    }
+                }
+
                 setSessionSetup(response);
                 if (ex != null) {
                     throw ex;
