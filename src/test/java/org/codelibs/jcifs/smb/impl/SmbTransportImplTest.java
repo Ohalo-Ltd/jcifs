@@ -478,6 +478,8 @@ class SmbTransportImplTest {
 
             SmbSessionImpl sess = mock(SmbSessionImpl.class);
             when(sess.getEncryptionContext()).thenReturn(sendCtx);
+            // session-level encryption requirement: encrypt on every tree
+            when(sess.getEncryptionContextFor(org.mockito.ArgumentMatchers.anyInt())).thenReturn(sendCtx);
             transport.registerSession(SESSION_ID, sess);
         }
 

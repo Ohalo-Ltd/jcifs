@@ -28,6 +28,7 @@ import java.util.EnumSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -101,6 +102,10 @@ final class SmbSessionImpl implements SmbSessionInternal {
 
     private SMBSigningDigest digest;
     private Smb2EncryptionContext encryptionContext;
+    /** whether the server requires encryption for the whole session (SMB2_SESSION_FLAG_ENCRYPT_DATA) */
+    private volatile boolean encryptData;
+    /** tree IDs of connected shares that require encryption (SMB2_SHAREFLAG_ENCRYPT_DATA) */
+    private final Set<Integer> encryptedTreeIds = ConcurrentHashMap.newKeySet();
 
     private final String targetDomain;
     private final String targetHost;
@@ -515,7 +520,9 @@ final class SmbSessionImpl implements SmbSessionInternal {
             log.debug("Initial session preauth hash " + Hexdump.toHexString(this.preauthIntegrityHash));
         }
 
-        boolean encryptData = false;
+        this.encryptData = false;
+        this.encryptionContext = null;
+        this.encryptedTreeIds.clear();
 
         while (true) {
             Subject s = this.credentials.getSubject();
@@ -567,7 +574,7 @@ final class SmbSessionImpl implements SmbSessionInternal {
                     // context is established and the preauth integrity hash is not
                     // final before the last session setup leg.
                     log.debug("Server requires encryption for this session");
-                    encryptData = true;
+                    this.encryptData = true;
                 }
 
                 if (preauthIntegrity) {
@@ -624,7 +631,7 @@ final class SmbSessionImpl implements SmbSessionInternal {
                     log.debug("No digest setup " + anonymous + " B " + isSignatureSetupRequired());
                 }
 
-                if (encryptData) {
+                if (this.encryptData) {
                     // Derive the encryption context only now: the session key is set
                     // and, for SMB 3.1.1, the preauth integrity hash is final (it
                     // includes the last session setup request but per spec not the
@@ -1113,7 +1120,7 @@ final class SmbSessionImpl implements SmbSessionInternal {
 
                 if (!inError && trans.isSMB2()) {
                     Smb2LogoffRequest request = new Smb2LogoffRequest(getConfig());
-                    if (this.encryptionContext == null) {
+                    if (getEncryptionContextFor(0) == null) {
                         // the logoff of an encrypting session is itself encrypted, not signed
                         request.setDigest(getDigest());
                     }
@@ -1236,7 +1243,45 @@ final class SmbSessionImpl implements SmbSessionInternal {
      * @return whether the transport will wrap it in a transform header
      */
     private boolean isRequestEncrypted(final CommonServerMessageBlockRequest request) {
-        return this.encryptionContext != null && request instanceof ServerMessageBlock2 s2 && !s2.isEncryptionExempt();
+        return request instanceof ServerMessageBlock2 s2 && !s2.isEncryptionExempt() && getEncryptionContextFor(s2.getTreeId()) != null;
+    }
+
+    /**
+     * Resolve the encryption context to use for a message on the given tree.
+     *
+     * Encryption applies when the server demanded it for the whole session
+     * (SMB2_SESSION_FLAG_ENCRYPT_DATA) or for the share the message is
+     * directed at (SMB2_SHAREFLAG_ENCRYPT_DATA).
+     *
+     * @param treeId tree the message belongs to
+     * @return the context to encrypt with, or null to send in cleartext
+     */
+    Smb2EncryptionContext getEncryptionContextFor(final int treeId) {
+        if (this.encryptionContext == null) {
+            return null;
+        }
+        if (this.encryptData || this.encryptedTreeIds.contains(treeId)) {
+            return this.encryptionContext;
+        }
+        return null;
+    }
+
+    /**
+     * Mark a connected tree as requiring encryption.
+     *
+     * @param treeId tree ID of the share
+     */
+    void addEncryptedTree(final int treeId) {
+        this.encryptedTreeIds.add(treeId);
+    }
+
+    /**
+     * Remove a tree from the encrypted set, on tree disconnect.
+     *
+     * @param treeId tree ID of the share
+     */
+    void removeEncryptedTree(final int treeId) {
+        this.encryptedTreeIds.remove(treeId);
     }
 
     /**
