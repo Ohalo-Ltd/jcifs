@@ -14,11 +14,11 @@ JCIFS is a comprehensive, pure Java implementation of the CIFS/SMB networking pr
 - **SMB2**: Full SMB 2.0.2, 2.1 support with enhanced performance
 - **SMB3**: Complete SMB 3.0, 3.0.2, 3.1.1 implementation featuring:
   - **AES-128-CCM encryption** (SMB 3.0/3.0.2)
-  - **AES-128-GCM encryption** (SMB 3.1.1)
+  - **AES-128-GCM, AES-256-GCM, AES-256-CCM encryption** (SMB 3.1.1)
   - **Pre-Authentication Integrity** (SMB 3.1.1)
   - **AES-CMAC signing** for data integrity
   - **Automatic protocol negotiation**
-  - **Transparent encryption** when required by server
+  - **Transparent encryption** when required by server or share
 
 ### **Security & Authentication**
 - **Multi-method Authentication**: NTLMSSP, Kerberos, SPNEGO
@@ -200,6 +200,45 @@ config.setProperty("jcifs.resolveOrder", "LMHOSTS,DNS,WINS,BCAST");
 
 CIFSContext customContext = new BaseContext(new PropertyConfiguration(config));
 ```
+
+### SMB3 Channel Encryption
+
+SMB 3.x channel encryption protects all traffic after session setup. It is
+what servers enforcing *encryption in transit* expect - for example Azure
+Files with *Require encryption in transit* (enabled by default for new
+storage accounts), Windows Server shares with `-RequireEncryption $true`,
+NetApp volumes with required encryption, or Samba with
+`smb encrypt = required`.
+
+```java
+Properties config = new Properties();
+// offer and use encryption when the server or share requires it
+config.setProperty("jcifs.client.encryptionEnabled", "true");
+// optional: refuse to talk to servers that cannot encrypt (fail closed)
+config.setProperty("jcifs.client.encryptionRequired", "true");
+// optional: narrow the offered ciphers, most preferred first
+config.setProperty("jcifs.client.encryptionCiphers", "AES-256-GCM,AES-128-GCM");
+
+CIFSContext encryptedContext = new BaseContext(new PropertyConfiguration(config));
+```
+
+| Property | Default | Meaning |
+|----------|---------|---------|
+| `jcifs.client.encryptionEnabled` | `false` | Advertise encryption support during negotiation and encrypt transparently whenever the session or share requires it. |
+| `jcifs.client.encryptionRequired` | `false` | Demand encryption for every connection: sessions on servers that cannot or will not encrypt fail with a clear error instead of downgrading to cleartext. Implies advertising encryption support. |
+| `jcifs.client.encryptionCiphers` | `AES-256-GCM,AES-128-GCM,AES-256-CCM,AES-128-CCM` | Ciphers offered in SMB 3.1.1 negotiation, most preferred first. Narrow the list to restrict connections, e.g. `AES-256-GCM` only for Azure Files' *Maximum security* profile. |
+
+Supported ciphers by dialect:
+
+| Dialect | Ciphers |
+|---------|---------|
+| SMB 3.0 / 3.0.2 | AES-128-CCM (fixed by the protocol, no cipher negotiation) |
+| SMB 3.1.1 | AES-256-GCM, AES-128-GCM, AES-256-CCM, AES-128-CCM (negotiated) |
+
+Channel encryption does not exist before SMB 3.0 - make sure
+`jcifs.client.maxVersion` is not capped below `SMB300`, or encryption is
+silently unavailable. Messages taking the encrypted path are not signed;
+the AEAD authentication tag protects their integrity (per MS-SMB2).
 
 ## 🏗️ Architecture Overview
 
