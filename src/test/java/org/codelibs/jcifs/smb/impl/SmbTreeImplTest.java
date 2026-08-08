@@ -54,6 +54,57 @@ class SmbTreeImplTest {
         when(session.isConnected()).thenReturn(true);
     }
 
+    @Test
+    void testShareRequiringEncryptionFailsWithoutContext() throws Exception {
+        // a share with SMB2_SHAREFLAG_ENCRYPT_DATA must not be used in
+        // cleartext - without an encryption context the connect has to fail
+        // with a clear diagnostic instead of access-denied errors later
+        when(transport.isSMB2()).thenReturn(true);
+        when(transport.getContext()).thenReturn(context);
+        when(session.getEncryptionContext()).thenReturn(null);
+
+        Smb2TreeConnectResponse resp = mock(Smb2TreeConnectResponse.class);
+        when(resp.isValidTid()).thenReturn(true);
+        when(resp.getTid()).thenReturn(5);
+        when(resp.getShareFlags()).thenReturn(Smb2TreeConnectResponse.SMB2_SHAREFLAG_ENCRYPT_DATA);
+
+        SmbTreeImpl tree = new SmbTreeImpl(session, "SECURE", "A:");
+        assertThrows(SmbUnsupportedOperationException.class, () -> tree.treeConnected(transport, session, resp));
+    }
+
+    @Test
+    void testShareRequiringEncryptionMarksTree() throws Exception {
+        when(transport.isSMB2()).thenReturn(true);
+        when(transport.getContext()).thenReturn(context);
+        when(session.getEncryptionContext()).thenReturn(mock(org.codelibs.jcifs.smb.internal.smb2.Smb2EncryptionContext.class));
+
+        Smb2TreeConnectResponse resp = mock(Smb2TreeConnectResponse.class);
+        when(resp.isValidTid()).thenReturn(true);
+        when(resp.getTid()).thenReturn(5);
+        when(resp.getShareFlags()).thenReturn(Smb2TreeConnectResponse.SMB2_SHAREFLAG_ENCRYPT_DATA);
+
+        SmbTreeImpl tree = new SmbTreeImpl(session, "SECURE", "A:");
+        tree.treeConnected(transport, session, resp);
+
+        org.mockito.Mockito.verify(session).addEncryptedTree(5);
+    }
+
+    @Test
+    void testShareWithoutEncryptionFlagDoesNotMarkTree() throws Exception {
+        when(transport.isSMB2()).thenReturn(true);
+        when(transport.getContext()).thenReturn(context);
+
+        Smb2TreeConnectResponse resp = mock(Smb2TreeConnectResponse.class);
+        when(resp.isValidTid()).thenReturn(true);
+        when(resp.getTid()).thenReturn(5);
+        when(resp.getShareFlags()).thenReturn(0);
+
+        SmbTreeImpl tree = new SmbTreeImpl(session, "PLAIN", "A:");
+        tree.treeConnected(transport, session, resp);
+
+        org.mockito.Mockito.verify(session, org.mockito.Mockito.never()).addEncryptedTree(org.mockito.ArgumentMatchers.anyInt());
+    }
+
     // Test case for the constructor of SmbTreeImpl
     @Test
     void testSmbTreeImplConstructor() {

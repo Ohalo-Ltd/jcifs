@@ -1059,7 +1059,8 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
 
     /**
      * Decide whether an outbound message must be encrypted and resolve the
-     * context to encrypt it with.
+     * context to encrypt it with. The owning session decides, based on the
+     * session- and share-level encryption requirements.
      *
      * @param smb the outbound message (head of a compound chain)
      * @return the encryption context to use, or null to send in cleartext
@@ -1072,7 +1073,11 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
         if (sessionId == 0) {
             return null;
         }
-        return encryptionContextFor(sessionId);
+        final SmbSessionImpl sess = this.sessionsById.get(sessionId);
+        if (sess == null) {
+            return null;
+        }
+        return sess.getEncryptionContextFor(s2.getTreeId());
     }
 
     /**

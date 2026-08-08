@@ -309,6 +309,34 @@ class SmbSessionImplTest {
     }
 
     @Test
+    @DisplayName("encryption context resolution honours session- and share-level requirements")
+    void testEncryptionContextResolution() throws Exception {
+        SmbSessionImpl session = newSession();
+        Smb2EncryptionContext enc = mock(Smb2EncryptionContext.class);
+
+        // no context -> nothing to encrypt with
+        assertNull(session.getEncryptionContextFor(1));
+
+        // a context alone does not force encryption - a requirement must exist
+        setField(session, "encryptionContext", enc);
+        assertNull(session.getEncryptionContextFor(1));
+
+        // session-level requirement (SMB2_SESSION_FLAG_ENCRYPT_DATA) covers every tree
+        setField(session, "encryptData", true);
+        assertSame(enc, session.getEncryptionContextFor(1));
+        assertSame(enc, session.getEncryptionContextFor(99));
+
+        // share-level requirement (SMB2_SHAREFLAG_ENCRYPT_DATA) covers only that tree
+        setField(session, "encryptData", false);
+        session.addEncryptedTree(7);
+        assertSame(enc, session.getEncryptionContextFor(7));
+        assertNull(session.getEncryptionContextFor(8), "Other trees stay in cleartext");
+
+        session.removeEncryptedTree(7);
+        assertNull(session.getEncryptionContextFor(7), "Disconnected trees no longer require encryption");
+    }
+
+    @Test
     @DisplayName("encryption: flags, encryption, and decryption delegation")
     void testEncryptionDelegation() throws Exception {
         SmbSessionImpl session = newSession();
