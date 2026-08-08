@@ -223,23 +223,106 @@ class Smb2EncryptionContextTest {
     }
 
     @Test
-    @DisplayName("Should round-trip a GCM message between mirrored contexts")
-    void testEncryptDecryptRoundTripGCM() throws Exception {
-        // This only passes if the decrypt side truncates the 16-byte nonce field
-        // to the 12 bytes AES-GCM actually uses - a full-length IV derives a
-        // different J0 and fails authentication.
-        // The AES-CCM round-trip is added once the CCM path moves to JCE.
+    @DisplayName("Should round-trip a message per cipher between mirrored contexts")
+    void testEncryptDecryptRoundTrip() throws Exception {
         byte[] message = "round trip across the transform header".getBytes(java.nio.charset.StandardCharsets.UTF_8);
 
-        // the peer's encryption key is our decryption key and vice versa
+        for (int cipherId : new int[] { Smb2EncryptionContext.CIPHER_AES_128_CCM, Smb2EncryptionContext.CIPHER_AES_128_GCM }) {
+            DialectVersion dialect = cipherId == Smb2EncryptionContext.CIPHER_AES_128_CCM ? DialectVersion.SMB300 : DialectVersion.SMB311;
+            // the peer's encryption key is our decryption key and vice versa
+            Smb2EncryptionContext sender = new Smb2EncryptionContext(cipherId, dialect, testEncryptionKey, testDecryptionKey);
+            Smb2EncryptionContext receiver = new Smb2EncryptionContext(cipherId, dialect, testDecryptionKey, testEncryptionKey);
+
+            byte[] encrypted = sender.encryptMessage(message, 0xAABBL);
+            byte[] decrypted = receiver.decryptMessage(encrypted);
+            org.junit.jupiter.api.Assertions.assertArrayEquals(message, decrypted,
+                    "Cipher " + cipherId + " round-trip should return the plaintext");
+        }
+    }
+
+    @Test
+    @DisplayName("Should reject a corrupted ciphertext or auth tag per cipher")
+    void testCorruptionIsRejected() throws Exception {
+        byte[] message = "integrity matters".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+        for (int cipherId : new int[] { Smb2EncryptionContext.CIPHER_AES_128_CCM, Smb2EncryptionContext.CIPHER_AES_128_GCM }) {
+            DialectVersion dialect = cipherId == Smb2EncryptionContext.CIPHER_AES_128_CCM ? DialectVersion.SMB300 : DialectVersion.SMB311;
+            Smb2EncryptionContext sender = new Smb2EncryptionContext(cipherId, dialect, testEncryptionKey, testDecryptionKey);
+            Smb2EncryptionContext receiver = new Smb2EncryptionContext(cipherId, dialect, testDecryptionKey, testEncryptionKey);
+
+            byte[] corruptCiphertext = sender.encryptMessage(message, 0x1L);
+            corruptCiphertext[Smb2TransformHeader.TRANSFORM_HEADER_SIZE] ^= (byte) 0xFF;
+            org.junit.jupiter.api.Assertions.assertThrows(org.codelibs.jcifs.smb.CIFSException.class,
+                    () -> receiver.decryptMessage(corruptCiphertext), "Corrupted ciphertext must not decrypt");
+
+            byte[] corruptTag = sender.encryptMessage(message, 0x1L);
+            corruptTag[4] ^= (byte) 0xFF; // signature field starts at offset 4
+            org.junit.jupiter.api.Assertions.assertThrows(org.codelibs.jcifs.smb.CIFSException.class,
+                    () -> receiver.decryptMessage(corruptTag), "Corrupted auth tag must not decrypt");
+        }
+    }
+
+    /**
+     * Recomputes the expected transform frame with an independent AES-GCM
+     * implementation (the JVM default provider, not the BouncyCastle provider
+     * the production code uses) and compares ciphertext and auth tag.
+     */
+    @Test
+    @DisplayName("Should produce a GCM frame matching an independent JCE computation")
+    void testGCMFrameAgainstIndependentOracle() throws Exception {
+        byte[] message = "oracle check".getBytes(java.nio.charset.StandardCharsets.UTF_8);
         Smb2EncryptionContext sender = new Smb2EncryptionContext(Smb2EncryptionContext.CIPHER_AES_128_GCM, DialectVersion.SMB311,
                 testEncryptionKey, testDecryptionKey);
-        Smb2EncryptionContext receiver = new Smb2EncryptionContext(Smb2EncryptionContext.CIPHER_AES_128_GCM, DialectVersion.SMB311,
-                testDecryptionKey, testEncryptionKey);
 
-        byte[] encrypted = sender.encryptMessage(message, 0xAABBL);
-        byte[] decrypted = receiver.decryptMessage(encrypted);
-        org.junit.jupiter.api.Assertions.assertArrayEquals(message, decrypted, "GCM round-trip should return the plaintext");
+        long sessionId = 0xCAFEBABEL;
+        byte[] frame = sender.encryptMessage(message, sessionId);
+        Smb2TransformHeader header = Smb2TransformHeader.decode(frame, 0);
+
+        // independent computation with the nonce the production code chose
+        javax.crypto.Cipher oracle = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding");
+        oracle.init(javax.crypto.Cipher.ENCRYPT_MODE, new javax.crypto.spec.SecretKeySpec(testEncryptionKey, "AES"),
+                new javax.crypto.spec.GCMParameterSpec(128, java.util.Arrays.copyOf(header.getNonce(), 12)));
+        oracle.updateAAD(header.getAssociatedData());
+        byte[] expected = oracle.doFinal(message);
+
+        byte[] actualCiphertext = java.util.Arrays.copyOfRange(frame, Smb2TransformHeader.TRANSFORM_HEADER_SIZE, frame.length);
+        org.junit.jupiter.api.Assertions.assertArrayEquals(java.util.Arrays.copyOf(expected, message.length), actualCiphertext,
+                "Ciphertext must match the independent computation");
+        org.junit.jupiter.api.Assertions.assertArrayEquals(java.util.Arrays.copyOfRange(expected, message.length, expected.length),
+                header.getSignature(), "Auth tag in the signature field must match the independent computation");
+    }
+
+    /**
+     * Same as the GCM oracle test, but for CCM the independent implementation
+     * is the BouncyCastle lightweight API (the JVM default providers offer no
+     * CCM), fed the associated data through its dedicated AAD input.
+     */
+    @Test
+    @DisplayName("Should produce a CCM frame matching an independent lightweight-API computation")
+    void testCCMFrameAgainstIndependentOracle() throws Exception {
+        byte[] message = "oracle check ccm".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        Smb2EncryptionContext sender = new Smb2EncryptionContext(Smb2EncryptionContext.CIPHER_AES_128_CCM, DialectVersion.SMB300,
+                testEncryptionKey, testDecryptionKey);
+
+        long sessionId = 0xDEADL;
+        byte[] frame = sender.encryptMessage(message, sessionId);
+        Smb2TransformHeader header = Smb2TransformHeader.decode(frame, 0);
+
+        org.bouncycastle.crypto.modes.CCMBlockCipher oracle =
+                new org.bouncycastle.crypto.modes.CCMBlockCipher(new org.bouncycastle.crypto.engines.AESEngine());
+        oracle.init(true, new org.bouncycastle.crypto.params.AEADParameters(
+                new org.bouncycastle.crypto.params.KeyParameter(testEncryptionKey), 128, java.util.Arrays.copyOf(header.getNonce(), 11)));
+        byte[] aad = header.getAssociatedData();
+        oracle.processAADBytes(aad, 0, aad.length);
+        byte[] expected = new byte[oracle.getOutputSize(message.length)];
+        int len = oracle.processBytes(message, 0, message.length, expected, 0);
+        oracle.doFinal(expected, len);
+
+        byte[] actualCiphertext = java.util.Arrays.copyOfRange(frame, Smb2TransformHeader.TRANSFORM_HEADER_SIZE, frame.length);
+        org.junit.jupiter.api.Assertions.assertArrayEquals(java.util.Arrays.copyOf(expected, message.length), actualCiphertext,
+                "Ciphertext must match the independent computation");
+        org.junit.jupiter.api.Assertions.assertArrayEquals(java.util.Arrays.copyOfRange(expected, message.length, expected.length),
+                header.getSignature(), "Auth tag in the signature field must match the independent computation");
     }
 
     @Test

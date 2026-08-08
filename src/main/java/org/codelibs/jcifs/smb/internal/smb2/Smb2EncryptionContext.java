@@ -17,6 +17,7 @@
  */
 package org.codelibs.jcifs.smb.internal.smb2;
 
+import java.security.GeneralSecurityException;
 import java.security.SecureRandom;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLong;
@@ -25,14 +26,10 @@ import javax.crypto.Cipher;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
-import org.bouncycastle.crypto.engines.AESEngine;
-import org.bouncycastle.crypto.modes.AEADBlockCipher;
-import org.bouncycastle.crypto.modes.CCMBlockCipher;
-import org.bouncycastle.crypto.params.AEADParameters;
-import org.bouncycastle.crypto.params.KeyParameter;
 import org.codelibs.jcifs.smb.CIFSException;
 import org.codelibs.jcifs.smb.DialectVersion;
 import org.codelibs.jcifs.smb.internal.smb2.nego.EncryptionNegotiateContext;
+import org.codelibs.jcifs.smb.util.Crypto;
 
 /**
  * SMB2/SMB3 Encryption Context
@@ -156,40 +153,17 @@ public class Smb2EncryptionContext {
             final Smb2TransformHeader transformHeader = new Smb2TransformHeader(Arrays.copyOf(nonce, 16), message.length, flags, sessionId);
             final byte[] associatedData = transformHeader.getAssociatedData();
 
-            byte[] ciphertext;
-            byte[] authTag;
+            final Cipher cipher = createCipher(true, nonce);
+            cipher.updateAAD(associatedData);
+            final byte[] encrypted = cipher.doFinal(message);
 
-            if (isGCMCipher()) {
-                // Use AES-GCM
-                final Cipher cipher = createGCMCipher(true, nonce);
-                cipher.updateAAD(associatedData);
-                final byte[] encrypted = cipher.doFinal(message);
-
-                // Split ciphertext and authentication tag
-                final int tagLength = getAuthTagLength();
-                ciphertext = new byte[encrypted.length - tagLength];
-                authTag = new byte[tagLength];
-                System.arraycopy(encrypted, 0, ciphertext, 0, ciphertext.length);
-                System.arraycopy(encrypted, ciphertext.length, authTag, 0, tagLength);
-            } else {
-                // Use AES-CCM with Bouncy Castle
-                final AEADBlockCipher cipher = createCCMCipher(true, nonce, associatedData.length, message.length);
-
-                final byte[] input = new byte[associatedData.length + message.length];
-                System.arraycopy(associatedData, 0, input, 0, associatedData.length);
-                System.arraycopy(message, 0, input, associatedData.length, message.length);
-
-                final byte[] output = new byte[cipher.getOutputSize(input.length)];
-                int len = cipher.processBytes(input, 0, input.length, output, 0);
-                len += cipher.doFinal(output, len);
-
-                // Split ciphertext and authentication tag
-                final int tagLength = getAuthTagLength();
-                ciphertext = new byte[message.length];
-                authTag = new byte[tagLength];
-                System.arraycopy(output, associatedData.length, ciphertext, 0, message.length);
-                System.arraycopy(output, output.length - tagLength, authTag, 0, tagLength);
-            }
+            // Split ciphertext and authentication tag: the tag is carried in the
+            // transform header signature field, not appended to the payload
+            final int tagLength = getAuthTagLength();
+            final byte[] ciphertext = new byte[encrypted.length - tagLength];
+            final byte[] authTag = new byte[tagLength];
+            System.arraycopy(encrypted, 0, ciphertext, 0, ciphertext.length);
+            System.arraycopy(encrypted, ciphertext.length, authTag, 0, tagLength);
 
             // Set authentication tag in transform header
             transformHeader.setSignature(authTag);
@@ -229,37 +203,15 @@ public class Smb2EncryptionContext {
             final byte[] ciphertext = new byte[ciphertextLength];
             System.arraycopy(encryptedMessage, Smb2TransformHeader.TRANSFORM_HEADER_SIZE, ciphertext, 0, ciphertextLength);
 
-            byte[] plaintext;
+            final Cipher cipher = createCipher(false, nonce);
+            cipher.updateAAD(associatedData);
 
-            if (isGCMCipher()) {
-                // Use AES-GCM
-                final Cipher cipher = createGCMCipher(false, nonce);
-                cipher.updateAAD(associatedData);
+            // Combine ciphertext and auth tag for decryption
+            final byte[] input = new byte[ciphertext.length + authTag.length];
+            System.arraycopy(ciphertext, 0, input, 0, ciphertext.length);
+            System.arraycopy(authTag, 0, input, ciphertext.length, authTag.length);
 
-                // Combine ciphertext and auth tag for decryption
-                final byte[] input = new byte[ciphertext.length + authTag.length];
-                System.arraycopy(ciphertext, 0, input, 0, ciphertext.length);
-                System.arraycopy(authTag, 0, input, ciphertext.length, authTag.length);
-
-                plaintext = cipher.doFinal(input);
-            } else {
-                // Use AES-CCM with Bouncy Castle
-                final AEADBlockCipher cipher = createCCMCipher(false, nonce, associatedData.length, ciphertext.length);
-
-                final byte[] input = new byte[associatedData.length + ciphertext.length + authTag.length];
-                System.arraycopy(associatedData, 0, input, 0, associatedData.length);
-                System.arraycopy(ciphertext, 0, input, associatedData.length, ciphertext.length);
-                System.arraycopy(authTag, 0, input, associatedData.length + ciphertext.length, authTag.length);
-
-                final byte[] output = new byte[cipher.getOutputSize(input.length)];
-                int len = cipher.processBytes(input, 0, input.length, output, 0);
-                len += cipher.doFinal(output, len);
-
-                plaintext = new byte[ciphertext.length];
-                System.arraycopy(output, associatedData.length, plaintext, 0, ciphertext.length);
-            }
-
-            return plaintext;
+            return cipher.doFinal(input);
         } catch (final Exception e) {
             throw new CIFSException("Failed to decrypt message", e);
         }
@@ -289,25 +241,25 @@ public class Smb2EncryptionContext {
         return this.cipherId;
     }
 
-    private Cipher createGCMCipher(final boolean encrypt, final byte[] nonce) throws Exception {
-        final String algorithm = "AES";
-        final SecretKeySpec keySpec = new SecretKeySpec(encrypt ? this.encryptionKey : this.decryptionKey, algorithm);
-
-        final Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-        final GCMParameterSpec gcmSpec = new GCMParameterSpec(getAuthTagLength() * 8, nonce);
-        cipher.init(encrypt ? Cipher.ENCRYPT_MODE : Cipher.DECRYPT_MODE, keySpec, gcmSpec);
-
-        return cipher;
-    }
-
-    private AEADBlockCipher createCCMCipher(final boolean encrypt, final byte[] nonce, final int aadLength, final int plaintextLength) {
-        final AEADBlockCipher cipher = new CCMBlockCipher(new AESEngine());
-
-        final KeyParameter keyParam = new KeyParameter(encrypt ? this.encryptionKey : this.decryptionKey);
-        final AEADParameters params = new AEADParameters(keyParam, getAuthTagLength() * 8, nonce, null);
-
-        cipher.init(encrypt, params);
-
+    /**
+     * Create an initialized AEAD cipher for the negotiated algorithm.
+     *
+     * Both ciphers are obtained through JCE from the provider configured via
+     * {@link Crypto#getProvider()}, so an installed custom provider (e.g. a
+     * FIPS-validated one) is honoured for the AEAD operations as well.
+     * GCMParameterSpec doubles as the parameter spec for CCM, carrying the
+     * nonce and tag length.
+     *
+     * @param encrypt whether to initialize for encryption (true) or decryption
+     * @param nonce nonce of the cipher's nonce length
+     * @return initialized cipher
+     */
+    private Cipher createCipher(final boolean encrypt, final byte[] nonce) throws GeneralSecurityException {
+        final String transformation = isGCMCipher() ? "AES/GCM/NoPadding" : "AES/CCM/NoPadding";
+        final Cipher cipher = Cipher.getInstance(transformation, Crypto.getProvider());
+        final SecretKeySpec keySpec = new SecretKeySpec(encrypt ? this.encryptionKey : this.decryptionKey, "AES");
+        final GCMParameterSpec spec = new GCMParameterSpec(getAuthTagLength() * 8, nonce);
+        cipher.init(encrypt ? Cipher.ENCRYPT_MODE : Cipher.DECRYPT_MODE, keySpec, spec);
         return cipher;
     }
 
