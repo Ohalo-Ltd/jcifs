@@ -263,6 +263,39 @@ class Smb2EncryptionContextTest {
     }
 
     @Test
+    @DisplayName("Should report cipher key lengths: 16 bytes for AES-128, 32 bytes for AES-256")
+    void testKeyLengths() {
+        assertEquals(16, Smb2EncryptionContext.getKeyLength(Smb2EncryptionContext.CIPHER_AES_128_CCM));
+        assertEquals(16, Smb2EncryptionContext.getKeyLength(Smb2EncryptionContext.CIPHER_AES_128_GCM));
+        assertEquals(32, Smb2EncryptionContext.getKeyLength(Smb2EncryptionContext.CIPHER_AES_256_CCM));
+        assertEquals(32, Smb2EncryptionContext.getKeyLength(Smb2EncryptionContext.CIPHER_AES_256_GCM));
+        assertThrows(IllegalArgumentException.class, () -> Smb2EncryptionContext.getKeyLength(0x99));
+    }
+
+    @Test
+    @DisplayName("Should round-trip AES-256 messages and use the spec nonce lengths")
+    void testAes256RoundTrip() throws Exception {
+        byte[] message = "round trip with 256-bit keys".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] k1 = new byte[32];
+        byte[] k2 = new byte[32];
+        new SecureRandom().nextBytes(k1);
+        new SecureRandom().nextBytes(k2);
+
+        for (int cipherId : new int[] { Smb2EncryptionContext.CIPHER_AES_256_CCM, Smb2EncryptionContext.CIPHER_AES_256_GCM }) {
+            Smb2EncryptionContext sender = new Smb2EncryptionContext(cipherId, DialectVersion.SMB311, k1, k2);
+            Smb2EncryptionContext receiver = new Smb2EncryptionContext(cipherId, DialectVersion.SMB311, k2, k1);
+
+            assertEquals(cipherId == Smb2EncryptionContext.CIPHER_AES_256_GCM ? 12 : 11, sender.getNonceLength(),
+                    "AES-256 uses the same nonce lengths as AES-128");
+
+            byte[] encrypted = sender.encryptMessage(message, 0x256L);
+            byte[] decrypted = receiver.decryptMessage(encrypted);
+            org.junit.jupiter.api.Assertions.assertArrayEquals(message, decrypted,
+                    "Cipher " + cipherId + " round-trip should return the plaintext");
+        }
+    }
+
+    @Test
     @DisplayName("Should reject transform header flags that do not match the dialect or cipher")
     void testTransformFlagsValidation() throws Exception {
         byte[] message = "flag check".getBytes(java.nio.charset.StandardCharsets.UTF_8);

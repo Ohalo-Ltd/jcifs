@@ -56,7 +56,14 @@ public class Smb2EncryptionContext {
      * AES-128-GCM cipher identifier for SMB3.1.1 encryption
      */
     public static final int CIPHER_AES_128_GCM = EncryptionNegotiateContext.CIPHER_AES128_GCM;
-    // Note: AES-256 variants are not currently defined in the negotiate context
+    /**
+     * AES-256-CCM cipher identifier for SMB3.1.1 encryption
+     */
+    public static final int CIPHER_AES_256_CCM = EncryptionNegotiateContext.CIPHER_AES256_CCM;
+    /**
+     * AES-256-GCM cipher identifier for SMB3.1.1 encryption
+     */
+    public static final int CIPHER_AES_256_GCM = EncryptionNegotiateContext.CIPHER_AES256_GCM;
 
     /**
      * Transform header flag indicating the message is encrypted
@@ -239,15 +246,22 @@ public class Smb2EncryptionContext {
     }
 
     private boolean isGCMCipher() {
-        return this.cipherId == CIPHER_AES_128_GCM;
+        return this.cipherId == CIPHER_AES_128_GCM || this.cipherId == CIPHER_AES_256_GCM;
     }
 
-    private int getKeyLength() {
-        // Currently only AES-128 is supported
-        if (this.cipherId == CIPHER_AES_128_CCM || this.cipherId == CIPHER_AES_128_GCM) {
-            return 16;
-        }
-        throw new IllegalArgumentException("Unsupported cipher: " + this.cipherId);
+    /**
+     * Get the key length for a cipher identifier.
+     *
+     * @param cipherId cipher identifier from the encryption negotiate context
+     * @return the cipher's key length in bytes
+     * @throws IllegalArgumentException for an unsupported cipher
+     */
+    public static int getKeyLength(final int cipherId) {
+        return switch (cipherId) {
+        case CIPHER_AES_128_CCM, CIPHER_AES_128_GCM -> 16;
+        case CIPHER_AES_256_CCM, CIPHER_AES_256_GCM -> 32;
+        default -> throw new IllegalArgumentException("Unsupported cipher: " + cipherId);
+        };
     }
 
     private int getAuthTagLength() {

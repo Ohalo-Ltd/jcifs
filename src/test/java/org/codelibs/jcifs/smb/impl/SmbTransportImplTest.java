@@ -427,6 +427,37 @@ class SmbTransportImplTest {
         }
 
         @Test
+        @DisplayName("createEncryptionContext derives 32-byte keys for a negotiated AES-256 cipher")
+        void createEncryptionContext_aes256() throws Exception {
+            byte[] sessionKey = new byte[16];
+            byte[] preauth = new byte[64];
+            java.util.Arrays.fill(sessionKey, (byte) 5);
+            java.util.Arrays.fill(preauth, (byte) 6);
+
+            setField(transport, "smb2", true);
+            Smb2NegotiateResponse smb311 = new Smb2NegotiateResponse(cfg);
+            setField(smb311, "selectedDialect", DialectVersion.SMB311);
+            setField(smb311, "selectedCipher", EncryptionNegotiateContext.CIPHER_AES256_GCM);
+            setField(transport, "negotiated", smb311);
+
+            Smb2EncryptionContext ctx256 = transport.createEncryptionContext(sessionKey, preauth);
+            assertEquals(EncryptionNegotiateContext.CIPHER_AES256_GCM, ctx256.getCipherId());
+
+            // a peer with mirrored 32-byte keys must be able to decrypt, proving
+            // the KDF derived AES-256-sized keys consistently
+            byte[] enc = org.codelibs.jcifs.smb.internal.smb2.Smb3KeyDerivation
+                    .deriveEncryptionKey(org.codelibs.jcifs.smb.internal.smb2.Smb2Constants.SMB2_DIALECT_0311, sessionKey, preauth, 32);
+            byte[] dec = org.codelibs.jcifs.smb.internal.smb2.Smb3KeyDerivation
+                    .deriveDecryptionKey(org.codelibs.jcifs.smb.internal.smb2.Smb2Constants.SMB2_DIALECT_0311, sessionKey, preauth, 32);
+            Smb2EncryptionContext peer =
+                    new Smb2EncryptionContext(EncryptionNegotiateContext.CIPHER_AES256_GCM, DialectVersion.SMB311, dec, enc);
+
+            byte[] message = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 };
+            assertArrayEquals(message, peer.decryptMessage(ctx256.encryptMessage(message, 0x2AL)),
+                    "AES-256-GCM frame must decrypt with independently derived 32-byte keys");
+        }
+
+        @Test
         @DisplayName("encryptionContextFor resolves a registered session's context by session ID")
         void encryptionContextLookup() {
             SmbSessionImpl sess = mock(SmbSessionImpl.class);

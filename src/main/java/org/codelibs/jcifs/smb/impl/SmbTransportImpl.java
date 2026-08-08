@@ -2020,8 +2020,9 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
         try {
             // Derive encryption and decryption keys using SMB3 KDF
             final int dialectInt = dialect.getDialect();
-            final byte[] encryptionKey = Smb3KeyDerivation.deriveEncryptionKey(dialectInt, sessionKey, preauthHash);
-            final byte[] decryptionKey = Smb3KeyDerivation.deriveDecryptionKey(dialectInt, sessionKey, preauthHash);
+            final int keyLength = Smb2EncryptionContext.getKeyLength(cipherId);
+            final byte[] encryptionKey = Smb3KeyDerivation.deriveEncryptionKey(dialectInt, sessionKey, preauthHash, keyLength);
+            final byte[] decryptionKey = Smb3KeyDerivation.deriveDecryptionKey(dialectInt, sessionKey, preauthHash, keyLength);
 
             return new Smb2EncryptionContext(cipherId, dialect, encryptionKey, decryptionKey);
         } catch (final Exception e) {
