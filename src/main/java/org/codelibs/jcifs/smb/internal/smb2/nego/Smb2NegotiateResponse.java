@@ -28,6 +28,7 @@ import org.codelibs.jcifs.smb.internal.SmbNegotiationRequest;
 import org.codelibs.jcifs.smb.internal.SmbNegotiationResponse;
 import org.codelibs.jcifs.smb.internal.smb2.ServerMessageBlock2Response;
 import org.codelibs.jcifs.smb.internal.smb2.Smb2Constants;
+import org.codelibs.jcifs.smb.internal.smb2.Smb2TransformHeader;
 import org.codelibs.jcifs.smb.internal.smb2.io.Smb2ReadResponse;
 import org.codelibs.jcifs.smb.internal.smb2.io.Smb2WriteRequest;
 import org.codelibs.jcifs.smb.internal.util.SMBUtil;
@@ -292,7 +293,14 @@ public class Smb2NegotiateResponse extends ServerMessageBlock2Response implement
             return false;
         }
 
-        final int maxBufferSize = tc.getConfig().getTransactionBufferSize();
+        int maxBufferSize = tc.getConfig().getTransactionBufferSize();
+        if (this.supportsEncryption) {
+            // encrypted frames carry a 52-byte transform header (which includes
+            // the auth tag) on top of the message; reserve that overhead so a
+            // maximum-size encrypted frame stays within the cleartext frame
+            // budget everywhere buffers are sized from these maxima
+            maxBufferSize -= Smb2TransformHeader.TRANSFORM_HEADER_SIZE;
+        }
         this.maxReadSize =
                 Math.min(maxBufferSize - Smb2ReadResponse.OVERHEAD, Math.min(tc.getConfig().getReceiveBufferSize(), this.maxReadSize))
                         & ~0x7;
