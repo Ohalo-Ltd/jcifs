@@ -23,6 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.Properties;
 import java.util.Random;
 
@@ -31,14 +32,16 @@ import org.codelibs.jcifs.smb.impl.NtlmPasswordAuthenticator;
 import org.codelibs.jcifs.smb.impl.SmbFile;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.output.Slf4jLogConsumer;
 import org.testcontainers.containers.wait.strategy.Wait;
+import org.testcontainers.images.builder.ImageFromDockerfile;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
-import org.testcontainers.utility.DockerImageName;
 
 /**
  * Integration tests against a Samba server that requires SMB 3.x channel
@@ -56,18 +59,68 @@ public class Smb3EncryptionIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(Smb3EncryptionIntegrationTest.class);
 
-    private static final String SAMBA_IMAGE = "dperson/samba:latest";
     private static final String USER = "encuser";
     private static final String PASSWORD = "enctest123";
     private static final String SHARE = "enc";
 
+    /**
+     * The fixture is built rather than pulled so the Samba version is pinned by
+     * the base image. This matters: the SMB 3.1.1 AES-256 ciphers only exist in
+     * Samba 4.15 and later, so an older server silently negotiates AES-128 and
+     * leaves {@code AES-256-GCM} - the first entry in the client's default
+     * preference order, and therefore the cipher most real servers select -
+     * completely untested. Alpine 3.21 ships Samba 4.20.
+     */
+    private static final String DOCKERFILE = """
+            FROM alpine:3.21
+            RUN apk add --no-cache samba-server samba-common-tools
+            COPY smb.conf /etc/samba/smb.conf
+            COPY entrypoint.sh /entrypoint.sh
+            RUN chmod +x /entrypoint.sh
+            EXPOSE 445
+            ENTRYPOINT ["/entrypoint.sh"]
+            """;
+
+    private static final String SMB_CONF = """
+            [global]
+               workgroup = WORKGROUP
+               server string = jcifs encryption fixture
+               security = user
+               passdb backend = tdbsam
+               map to guest = never
+               disable netbios = yes
+               smb ports = 445
+               logging = stdout
+               log level = 1
+               server min protocol = SMB3_00
+               smb encrypt = required
+               server smb3 encryption algorithms = AES-256-GCM AES-128-GCM AES-256-CCM AES-128-CCM
+
+            [enc]
+               path = /share/enc
+               browseable = yes
+               read only = no
+               guest ok = no
+               valid users = encuser
+            """;
+
+    private static final String ENTRYPOINT = """
+            #!/bin/sh
+            set -e
+            mkdir -p /share/enc
+            chmod 0777 /share/enc
+            adduser -D -H -s /sbin/nologin SMBUSER 2>/dev/null || true
+            printf 'SMBPASS\\nSMBPASS\\n' | smbpasswd -a -s SMBUSER
+            exec smbd --foreground --no-process-group --debug-stdout
+            """.replace("SMBUSER", USER).replace("SMBPASS", PASSWORD);
+
     @Container
     private static final GenericContainer<?> sambaContainer =
-            new GenericContainer<>(DockerImageName.parse(SAMBA_IMAGE)).withExposedPorts(445)
-                    .withCommand("-u", USER + ";" + PASSWORD, "-s", SHARE + ";/share/" + SHARE + ";yes;no;no;" + USER, "-g",
-                            "server min protocol = SMB3_00", "-g", "smb encrypt = required", "-p")
-                    .waitingFor(Wait.forListeningPorts(445).withStartupTimeout(java.time.Duration.ofSeconds(60)))
-                    .withLogConsumer(new Slf4jLogConsumer(log).withPrefix("SAMBA-ENC"));
+            new GenericContainer<>(new ImageFromDockerfile("jcifs-samba-enc", false).withFileFromString("Dockerfile", DOCKERFILE)
+                    .withFileFromString("smb.conf", SMB_CONF)
+                    .withFileFromString("entrypoint.sh", ENTRYPOINT)).withExposedPorts(445)
+                            .waitingFor(Wait.forLogMessage(".*smbd version.*started.*\\n", 1).withStartupTimeout(Duration.ofSeconds(180)))
+                            .withLogConsumer(new Slf4jLogConsumer(log).withPrefix("SAMBA-ENC"));
 
     private static String sambaHost;
     private static int sambaPort;
@@ -92,10 +145,27 @@ public class Smb3EncryptionIntegrationTest {
      */
     private static CIFSContext createContext(final String minVersion, final String maxVersion, final boolean encryptionEnabled)
             throws CIFSException {
+        return createContext(minVersion, maxVersion, encryptionEnabled, null);
+    }
+
+    /**
+     * Creates a context that offers SMB 3.x encryption within the given dialect range.
+     *
+     * @param minVersion minimum dialect, e.g. "SMB300"
+     * @param maxVersion maximum dialect, e.g. "SMB311"
+     * @param encryptionEnabled whether to advertise encryption support
+     * @param ciphers cipher list to offer, or null for the default preference order
+     * @return a configured context
+     */
+    private static CIFSContext createContext(final String minVersion, final String maxVersion, final boolean encryptionEnabled,
+            final String ciphers) throws CIFSException {
         final Properties props = new Properties();
         props.setProperty("jcifs.client.minVersion", minVersion);
         props.setProperty("jcifs.client.maxVersion", maxVersion);
         props.setProperty("jcifs.client.encryptionEnabled", String.valueOf(encryptionEnabled));
+        if (ciphers != null) {
+            props.setProperty("jcifs.client.encryptionCiphers", ciphers);
+        }
 
         final BaseContext context = new BaseContext(new org.codelibs.jcifs.smb.config.PropertyConfiguration(props));
         return context.withCredentials(new NtlmPasswordAuthenticator(USER, PASSWORD));
@@ -146,6 +216,21 @@ public class Smb3EncryptionIntegrationTest {
         final byte[] content = "encrypted over SMB 3.0".getBytes(StandardCharsets.UTF_8);
         writeFile(ctx, shareUrl("enc300.txt"), content);
         assertArrayEquals(content, readFile(ctx, shareUrl("enc300.txt")), "Encrypted SMB 3.0 round-trip should preserve content");
+    }
+
+    @ParameterizedTest(name = "SMB 3.1.1 over {0}")
+    @ValueSource(strings = { "AES-128-CCM", "AES-128-GCM", "AES-256-CCM", "AES-256-GCM" })
+    void testEachNegotiatedCipher(final String cipher) throws Exception {
+        // Pin the offered cipher so every algorithm gets exercised against a real
+        // server, rather than only whichever one the server happens to prefer.
+        // The AES-256 variants use a 32-byte key (L=256 in the SP800-108 KDF) and
+        // are otherwise only covered by self-consistent round-trip unit tests,
+        // which cannot detect a wire-format deviation.
+        final CIFSContext ctx = createContext("SMB311", "SMB311", true, cipher);
+        final byte[] content = ("encrypted with " + cipher).getBytes(StandardCharsets.UTF_8);
+        final String url = shareUrl("cipher-" + cipher + ".txt");
+        writeFile(ctx, url, content);
+        assertArrayEquals(content, readFile(ctx, url), cipher + " round-trip should preserve content");
     }
 
     @Test
