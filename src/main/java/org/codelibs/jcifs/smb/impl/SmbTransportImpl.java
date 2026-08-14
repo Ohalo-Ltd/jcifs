@@ -1984,12 +1984,16 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
     /**
      * Create encryption context for SMB3 encrypted communication
      *
-     * @param sessionKey the session key from GSS-API authentication
+     * @param sessionKey the session key from GSS-API authentication, truncated
+     *            to 16 bytes (MS-SMB2 Session.SessionKey)
+     * @param fullSessionKey the untruncated session key (MS-SMB2
+     *            Session.FullSessionKey), required for the AES-256 ciphers
      * @param preauthHash the pre-authentication integrity hash (SMB 3.1.1 only)
      * @return encryption context
      * @throws CIFSException if encryption is not supported or fails
      */
-    Smb2EncryptionContext createEncryptionContext(final byte[] sessionKey, final byte[] preauthHash) throws CIFSException {
+    Smb2EncryptionContext createEncryptionContext(final byte[] sessionKey, final byte[] fullSessionKey, final byte[] preauthHash)
+            throws CIFSException {
         if (!this.smb2 || this.negotiated == null) {
             throw new SmbUnsupportedOperationException("SMB2/SMB3 required for encryption");
         }
@@ -2032,12 +2036,32 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
             throw new SmbUnsupportedOperationException("SMB3 required for encryption, negotiated: " + dialect);
         }
 
+        final int keyLength = Smb2EncryptionContext.getKeyLength(cipherId);
+
+        // MS-SMB2 3.1.4.2: the AES-256 ciphers derive their keys from
+        // Session.FullSessionKey with L=256, everything else - signing, the
+        // application key, the AES-128 ciphers - from the 16-byte
+        // Session.SessionKey with L=128. The two are the same array for NTLM,
+        // whose key is always 16 bytes, but a Kerberos AES256 session key is 32
+        // bytes: deriving from the truncated form there produces keys the
+        // server cannot reproduce, and it silently discards everything the
+        // client sends.
+        final byte[] kdfKey;
+        if (keyLength > 16) {
+            if (fullSessionKey == null || fullSessionKey.length == 0) {
+                throw new SmbUnsupportedOperationException(
+                        "The full session key is required to derive keys for cipher 0x" + Integer.toHexString(cipherId));
+            }
+            kdfKey = fullSessionKey;
+        } else {
+            kdfKey = sessionKey;
+        }
+
         try {
             // Derive encryption and decryption keys using SMB3 KDF
             final int dialectInt = dialect.getDialect();
-            final int keyLength = Smb2EncryptionContext.getKeyLength(cipherId);
-            final byte[] encryptionKey = Smb3KeyDerivation.deriveEncryptionKey(dialectInt, sessionKey, preauthHash, keyLength);
-            final byte[] decryptionKey = Smb3KeyDerivation.deriveDecryptionKey(dialectInt, sessionKey, preauthHash, keyLength);
+            final byte[] encryptionKey = Smb3KeyDerivation.deriveEncryptionKey(dialectInt, kdfKey, preauthHash, keyLength);
+            final byte[] decryptionKey = Smb3KeyDerivation.deriveDecryptionKey(dialectInt, kdfKey, preauthHash, keyLength);
 
             return new Smb2EncryptionContext(cipherId, dialect, encryptionKey, decryptionKey);
         } catch (final Exception e) {

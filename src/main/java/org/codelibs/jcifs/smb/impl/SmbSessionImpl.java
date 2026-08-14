@@ -93,6 +93,13 @@ final class SmbSessionImpl implements SmbSessionInternal {
 
     private CredentialsInternal credentials;
     private byte[] sessionKey;
+    /**
+     * The authentication key exactly as the security context produced it, with
+     * neither truncation nor padding - MS-SMB2's Session.FullSessionKey, which
+     * the AES-256 ciphers derive from. Differs from {@link #sessionKey} only
+     * for mechanisms whose key is not 16 bytes, i.e. Kerberos.
+     */
+    private byte[] fullSessionKey;
     private boolean extendedSecurity;
 
     private final AtomicLong usageCount = new AtomicLong(1);
@@ -601,6 +608,10 @@ final class SmbSessionImpl implements SmbSessionInternal {
                     byte[] key = new byte[16];
                     System.arraycopy(sk, 0, key, 0, Math.min(16, sk.length));
                     this.sessionKey = key;
+                    // keep the key as it came out of the security context as well:
+                    // signing and the AES-128 ciphers use the truncated form above,
+                    // but the AES-256 ciphers derive from this one (MS-SMB2 3.1.4.2)
+                    this.fullSessionKey = sk.clone();
                 }
 
                 boolean signed = response != null && response.isSigned();
@@ -644,7 +655,8 @@ final class SmbSessionImpl implements SmbSessionInternal {
                     // final response). Deriving is cheap; not having the keys when a
                     // requirement surfaces is the bug.
                     try {
-                        this.encryptionContext = trans.createEncryptionContext(this.sessionKey, this.preauthIntegrityHash);
+                        this.encryptionContext =
+                                trans.createEncryptionContext(this.sessionKey, this.fullSessionKey, this.preauthIntegrityHash);
                         if (log.isDebugEnabled()) {
                             log.debug("Created encryption context, cipher " + this.encryptionContext.getCipherId());
                         }
