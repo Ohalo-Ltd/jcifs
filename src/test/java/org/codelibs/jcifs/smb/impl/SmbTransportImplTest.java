@@ -373,7 +373,8 @@ class SmbTransportImplTest {
         @Test
         @DisplayName("createEncryptionContext rejects when SMB2/3 not negotiated")
         void createEncryptionContext_rejects_noNegotiation() {
-            assertThrows(SmbUnsupportedOperationException.class, () -> transport.createEncryptionContext(new byte[] { 1 }, null));
+            assertThrows(SmbUnsupportedOperationException.class,
+                    () -> transport.createEncryptionContext(new byte[] { 1 }, new byte[] { 1 }, null));
         }
 
         @Test
@@ -383,7 +384,8 @@ class SmbTransportImplTest {
             Smb2NegotiateResponse nego = new Smb2NegotiateResponse(cfg);
             setField(nego, "selectedDialect", DialectVersion.SMB210);
             setField(transport, "negotiated", nego);
-            assertThrows(SmbUnsupportedOperationException.class, () -> transport.createEncryptionContext(new byte[] { 1, 2, 3, 4 }, null));
+            assertThrows(SmbUnsupportedOperationException.class,
+                    () -> transport.createEncryptionContext(new byte[] { 1, 2, 3, 4 }, new byte[] { 1, 2, 3, 4 }, null));
         }
 
         @Test
@@ -397,8 +399,9 @@ class SmbTransportImplTest {
             // e.g. anonymous sessions have no session key; the failure must be an
             // SmbUnsupportedOperationException, not the KDF's IllegalArgumentException
             // ("A KDF requires Ki (a seed) as input", refs codelibs/jcifs#70)
-            assertThrows(SmbUnsupportedOperationException.class, () -> transport.createEncryptionContext(null, new byte[64]));
-            assertThrows(SmbUnsupportedOperationException.class, () -> transport.createEncryptionContext(new byte[0], new byte[64]));
+            assertThrows(SmbUnsupportedOperationException.class, () -> transport.createEncryptionContext(null, null, new byte[64]));
+            assertThrows(SmbUnsupportedOperationException.class,
+                    () -> transport.createEncryptionContext(new byte[0], new byte[0], new byte[64]));
         }
 
         @Test
@@ -412,7 +415,7 @@ class SmbTransportImplTest {
             Smb2NegotiateResponse smb300 = new Smb2NegotiateResponse(cfg);
             setField(smb300, "selectedDialect", DialectVersion.SMB300);
             setField(transport, "negotiated", smb300);
-            Smb2EncryptionContext ccm = transport.createEncryptionContext(sessionKey, preauth);
+            Smb2EncryptionContext ccm = transport.createEncryptionContext(sessionKey, sessionKey, preauth);
             assertEquals(EncryptionNegotiateContext.CIPHER_AES128_CCM, ccm.getCipherId());
             assertEquals(DialectVersion.SMB300, ccm.getDialect());
 
@@ -421,7 +424,7 @@ class SmbTransportImplTest {
             setField(smb311, "selectedDialect", DialectVersion.SMB311);
             setField(smb311, "selectedCipher", -1);
             setField(transport, "negotiated", smb311);
-            Smb2EncryptionContext gcm = transport.createEncryptionContext(sessionKey, preauth);
+            Smb2EncryptionContext gcm = transport.createEncryptionContext(sessionKey, sessionKey, preauth);
             assertEquals(EncryptionNegotiateContext.CIPHER_AES128_GCM, gcm.getCipherId());
             assertEquals(DialectVersion.SMB311, gcm.getDialect());
         }
@@ -437,12 +440,13 @@ class SmbTransportImplTest {
             // SMB 3.0 only supports AES-128-CCM - narrowing it away must fail
             // clearly instead of encrypting with a disallowed cipher
             when(cfg.getEncryptionCiphers()).thenReturn(new int[] { EncryptionNegotiateContext.CIPHER_AES256_GCM });
-            assertThrows(SmbUnsupportedOperationException.class, () -> transport.createEncryptionContext(new byte[16], null));
+            assertThrows(SmbUnsupportedOperationException.class, () -> transport.createEncryptionContext(new byte[16], new byte[16], null));
 
             // with AES-128-CCM allowed it works
             when(cfg.getEncryptionCiphers())
                     .thenReturn(new int[] { EncryptionNegotiateContext.CIPHER_AES256_GCM, EncryptionNegotiateContext.CIPHER_AES128_CCM });
-            assertEquals(EncryptionNegotiateContext.CIPHER_AES128_CCM, transport.createEncryptionContext(new byte[16], null).getCipherId());
+            assertEquals(EncryptionNegotiateContext.CIPHER_AES128_CCM,
+                    transport.createEncryptionContext(new byte[16], new byte[16], null).getCipherId());
         }
 
         @Test
@@ -459,7 +463,7 @@ class SmbTransportImplTest {
             setField(smb311, "selectedCipher", EncryptionNegotiateContext.CIPHER_AES256_GCM);
             setField(transport, "negotiated", smb311);
 
-            Smb2EncryptionContext ctx256 = transport.createEncryptionContext(sessionKey, preauth);
+            Smb2EncryptionContext ctx256 = transport.createEncryptionContext(sessionKey, sessionKey, preauth);
             assertEquals(EncryptionNegotiateContext.CIPHER_AES256_GCM, ctx256.getCipherId());
 
             // a peer with mirrored 32-byte keys must be able to decrypt, proving
@@ -474,6 +478,59 @@ class SmbTransportImplTest {
             byte[] message = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 };
             assertArrayEquals(message, peer.decryptMessage(ctx256.encryptMessage(message, 0x2AL)),
                     "AES-256-GCM frame must decrypt with independently derived 32-byte keys");
+        }
+
+        @Test
+        @DisplayName("createEncryptionContext derives AES-256 keys from the full session key, not the truncated one")
+        void createEncryptionContext_aes256_usesFullSessionKey() throws Exception {
+            // a Kerberos AES256 session key is 32 bytes; MS-SMB2 3.1.4.2 derives
+            // the AES-256 cipher keys from it untruncated, while signing and the
+            // AES-128 ciphers use the 16-byte truncation of the same key
+            byte[] fullSessionKey = new byte[32];
+            for (int i = 0; i < fullSessionKey.length; i++) {
+                fullSessionKey[i] = (byte) (i + 1);
+            }
+            byte[] truncatedSessionKey = java.util.Arrays.copyOf(fullSessionKey, 16);
+            byte[] preauth = new byte[64];
+            java.util.Arrays.fill(preauth, (byte) 7);
+
+            setField(transport, "smb2", true);
+            Smb2NegotiateResponse smb311 = new Smb2NegotiateResponse(cfg);
+            setField(smb311, "selectedDialect", DialectVersion.SMB311);
+            setField(smb311, "selectedCipher", EncryptionNegotiateContext.CIPHER_AES256_GCM);
+            setField(transport, "negotiated", smb311);
+
+            Smb2EncryptionContext ctx = transport.createEncryptionContext(truncatedSessionKey, fullSessionKey, preauth);
+
+            int dialect = org.codelibs.jcifs.smb.internal.smb2.Smb2Constants.SMB2_DIALECT_0311;
+            byte[] fromFull =
+                    org.codelibs.jcifs.smb.internal.smb2.Smb3KeyDerivation.deriveEncryptionKey(dialect, fullSessionKey, preauth, 32);
+            byte[] fromTruncated =
+                    org.codelibs.jcifs.smb.internal.smb2.Smb3KeyDerivation.deriveEncryptionKey(dialect, truncatedSessionKey, preauth, 32);
+            assertFalse(java.util.Arrays.equals(fromFull, fromTruncated), "test premise: the two derivations must differ");
+
+            // a peer keyed off the full session key - as any spec-conforming
+            // server is - must be able to decrypt what this context produces
+            byte[] decFromFull =
+                    org.codelibs.jcifs.smb.internal.smb2.Smb3KeyDerivation.deriveDecryptionKey(dialect, fullSessionKey, preauth, 32);
+            Smb2EncryptionContext peer =
+                    new Smb2EncryptionContext(EncryptionNegotiateContext.CIPHER_AES256_GCM, DialectVersion.SMB311, decFromFull, fromFull);
+
+            byte[] message = new byte[] { 9, 8, 7, 6, 5, 4, 3, 2 };
+            assertArrayEquals(message, peer.decryptMessage(ctx.encryptMessage(message, 0x2AL)),
+                    "AES-256 keys must be derived from the untruncated session key");
+        }
+
+        @Test
+        @DisplayName("createEncryptionContext refuses AES-256 without a full session key instead of using a wrong one")
+        void createEncryptionContext_aes256_requiresFullSessionKey() throws Exception {
+            setField(transport, "smb2", true);
+            Smb2NegotiateResponse smb311 = new Smb2NegotiateResponse(cfg);
+            setField(smb311, "selectedDialect", DialectVersion.SMB311);
+            setField(smb311, "selectedCipher", EncryptionNegotiateContext.CIPHER_AES256_CCM);
+            setField(transport, "negotiated", smb311);
+
+            assertThrows(SmbUnsupportedOperationException.class, () -> transport.createEncryptionContext(new byte[16], null, new byte[64]));
         }
 
         @Test
