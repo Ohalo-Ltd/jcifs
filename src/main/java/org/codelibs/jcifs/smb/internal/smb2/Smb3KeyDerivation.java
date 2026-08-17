@@ -87,11 +87,25 @@ public final class Smb3KeyDerivation {
      * @param dialect the SMB dialect version
      * @param sessionKey the base session key
      * @param preauthIntegrity the pre-authentication integrity hash (for SMB 3.1.1) or null
-     * @return derived encryption key
+     * @return derived 16-byte encryption key
      */
     public static byte[] deriveEncryptionKey(final int dialect, final byte[] sessionKey, final byte[] preauthIntegrity) {
+        return deriveEncryptionKey(dialect, sessionKey, preauthIntegrity, 16);
+    }
+
+    /**
+     * Derives the SMB3 encryption key of the given length from the session key.
+     *
+     * @param dialect the SMB dialect version
+     * @param sessionKey the base session key
+     * @param preauthIntegrity the pre-authentication integrity hash (for SMB 3.1.1) or null
+     * @param keyLength the cipher's key length in bytes (16 for AES-128, 32 for AES-256)
+     * @return derived encryption key
+     */
+    public static byte[] deriveEncryptionKey(final int dialect, final byte[] sessionKey, final byte[] preauthIntegrity,
+            final int keyLength) {
         return derive(sessionKey, dialect == Smb2Constants.SMB2_DIALECT_0311 ? ENCLABEL_311 : ENCLABEL_300,
-                dialect == Smb2Constants.SMB2_DIALECT_0311 ? preauthIntegrity : ENCCONTEXT_300);
+                dialect == Smb2Constants.SMB2_DIALECT_0311 ? preauthIntegrity : ENCCONTEXT_300, keyLength);
     }
 
     /**
@@ -100,20 +114,39 @@ public final class Smb3KeyDerivation {
      * @param dialect the SMB dialect version
      * @param sessionKey the base session key
      * @param preauthIntegrity the pre-authentication integrity hash (for SMB 3.1.1) or null
-     * @return derived decryption key
+     * @return derived 16-byte decryption key
      */
     public static byte[] deriveDecryptionKey(final int dialect, final byte[] sessionKey, final byte[] preauthIntegrity) {
-        return derive(sessionKey, dialect == Smb2Constants.SMB2_DIALECT_0311 ? DECLABEL_311 : DECLABEL_300,
-                dialect == Smb2Constants.SMB2_DIALECT_0311 ? preauthIntegrity : DECCONTEXT_300);
+        return deriveDecryptionKey(dialect, sessionKey, preauthIntegrity, 16);
+    }
 
+    /**
+     * Derives the SMB3 decryption key of the given length from the session key.
+     *
+     * @param dialect the SMB dialect version
+     * @param sessionKey the base session key
+     * @param preauthIntegrity the pre-authentication integrity hash (for SMB 3.1.1) or null
+     * @param keyLength the cipher's key length in bytes (16 for AES-128, 32 for AES-256)
+     * @return derived decryption key
+     */
+    public static byte[] deriveDecryptionKey(final int dialect, final byte[] sessionKey, final byte[] preauthIntegrity,
+            final int keyLength) {
+        return derive(sessionKey, dialect == Smb2Constants.SMB2_DIALECT_0311 ? DECLABEL_311 : DECLABEL_300,
+                dialect == Smb2Constants.SMB2_DIALECT_0311 ? preauthIntegrity : DECCONTEXT_300, keyLength);
+
+    }
+
+    private static byte[] derive(final byte[] sessionKey, final byte[] label, final byte[] context) {
+        return derive(sessionKey, label, context, 16);
     }
 
     /**
      * @param sessionKey
      * @param label
      * @param context
+     * @param keyLength output key length in bytes
      */
-    private static byte[] derive(final byte[] sessionKey, final byte[] label, final byte[] context) {
+    private static byte[] derive(final byte[] sessionKey, final byte[] label, final byte[] context, final int keyLength) {
         final KDFCounterBytesGenerator gen = new KDFCounterBytesGenerator(new HMac(new SHA256Digest()));
 
         final int r = 32;
@@ -130,14 +163,17 @@ public final class Smb3KeyDerivation {
         // + 1 byte 0x00
         // + context
         System.arraycopy(context, 0, suffix, label.length + 1, context.length);
-        // + 4 byte (== r bits) big endian encoding of L
-        suffix[suffix.length - 1] = (byte) 128;
+        // + 4 byte big endian encoding of L, the output length in bits
+        // (128 encodes as 00 00 00 80, 256 as 00 00 01 00)
+        final int lBits = keyLength * 8;
+        suffix[suffix.length - 2] = (byte) (lBits >> 8 & 0xFF);
+        suffix[suffix.length - 1] = (byte) (lBits & 0xFF);
 
         final DerivationParameters param = new KDFCounterParameters(sessionKey, null /* prefix */, suffix /* suffix */, r /* r */);
         gen.init(param);
 
-        final byte[] derived = new byte[16];
-        gen.generateBytes(derived, 0, 16);
+        final byte[] derived = new byte[keyLength];
+        gen.generateBytes(derived, 0, keyLength);
         return derived;
     }
 

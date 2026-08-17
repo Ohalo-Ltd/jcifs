@@ -60,6 +60,7 @@ import org.codelibs.jcifs.smb.internal.smb2.ioctl.ValidateNegotiateInfoResponse;
 import org.codelibs.jcifs.smb.internal.smb2.nego.Smb2NegotiateRequest;
 import org.codelibs.jcifs.smb.internal.smb2.nego.Smb2NegotiateResponse;
 import org.codelibs.jcifs.smb.internal.smb2.tree.Smb2TreeConnectRequest;
+import org.codelibs.jcifs.smb.internal.smb2.tree.Smb2TreeConnectResponse;
 import org.codelibs.jcifs.smb.internal.smb2.tree.Smb2TreeDisconnectRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -413,7 +414,16 @@ class SmbTreeImpl implements SmbTreeInternal {
             // this does not make any sense if we are disconnecting right now
             T chainedResponse = null;
             if (!(request instanceof SmbComTreeDisconnect) && !(request instanceof Smb2TreeDisconnectRequest)) {
-                chainedResponse = treeConnect(request, response);
+                if (sess.getEncryptionContext() != null && sess.getEncryptionContextFor(0) == null) {
+                    // encryption is available but not required at the session level:
+                    // whether this request must be encrypted depends on the share's
+                    // SMB2_SHAREFLAG_ENCRYPT_DATA, which is only known once the tree
+                    // connect response arrives - do not chain the payload onto the
+                    // tree connect, send it separately afterwards
+                    treeConnect(null, null);
+                } else {
+                    chainedResponse = treeConnect(request, response);
+                }
             }
             if (request == null || chainedResponse != null && chainedResponse.isReceived()) {
                 return chainedResponse;
@@ -628,7 +638,7 @@ class SmbTreeImpl implements SmbTreeInternal {
      * @param response
      * @throws IOException
      */
-    private void treeConnected(final SmbTransportImpl transport, final SmbSessionImpl sess, final TreeConnectResponse response)
+    void treeConnected(final SmbTransportImpl transport, final SmbSessionImpl sess, final TreeConnectResponse response)
             throws CIFSException {
         if (!response.isValidTid()) {
             throw new SmbException("TreeID is invalid");
@@ -642,6 +652,20 @@ class SmbTreeImpl implements SmbTreeInternal {
         if (transport.getContext().getConfig().isIpcSigningEnforced() && ("IPC$".equals(this.getShare()) || "IPC".equals(rsvc))
                 && !sess.getCredentials().isAnonymous() && sess.getDigest() == null) {
             throw new SmbException("IPC signing is enforced, but no signing is available");
+        }
+
+        if (response instanceof Smb2TreeConnectResponse tcResp
+                && (tcResp.getShareFlags() & Smb2TreeConnectResponse.SMB2_SHAREFLAG_ENCRYPT_DATA) != 0) {
+            // the share demands encryption for all traffic on this tree
+            // (MS-SMB2 3.2.5.5) - fail clearly if the session cannot provide it
+            // rather than continuing in cleartext and running into
+            // access-denied errors on every subsequent operation
+            if (sess.getEncryptionContext() == null) {
+                throw new SmbUnsupportedOperationException(
+                        "Share " + this.share + " requires encryption, but the session has no encryption context available");
+            }
+            log.debug("Share requires encryption");
+            sess.addEncryptedTree(this.tid);
         }
 
         this.service = rsvc;
@@ -803,6 +827,7 @@ class SmbTreeImpl implements SmbTreeInternal {
                         }
                     }
                 }
+                sess.removeEncryptedTree(this.tid);
                 this.inDfs = false;
                 this.inDomainDfs = false;
                 this.connectionState.set(0);

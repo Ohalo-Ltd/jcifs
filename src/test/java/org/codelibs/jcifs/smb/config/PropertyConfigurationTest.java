@@ -1,5 +1,6 @@
 package org.codelibs.jcifs.smb.config;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -216,6 +217,39 @@ class PropertyConfigurationTest extends BaseTest {
         assertTrue(testConfig.isSigningEnforced());
         assertTrue(testConfig.isSigningEnabled());
         assertFalse(testConfig.isEncryptionEnabled());
+    }
+
+    @Test
+    @DisplayName("Should parse jcifs.client.encryptionRequired, defaulting to false")
+    void testEncryptionRequiredProperty() throws CIFSException {
+        // default: not required
+        assertFalse(new PropertyConfiguration(new Properties()).isEncryptionRequired());
+
+        // explicit
+        Properties props = new Properties();
+        props.setProperty("jcifs.client.encryptionRequired", "true");
+        assertTrue(new PropertyConfiguration(props).isEncryptionRequired());
+    }
+
+    @Test
+    @DisplayName("Should parse jcifs.client.encryptionCiphers with the MS-SMB2 preference order default")
+    void testEncryptionCiphersProperty() throws CIFSException {
+        // default: all four ciphers, most preferred first per MS-SMB2 2.2.3.1.2
+        assertArrayEquals(new int[] { 0x04, 0x02, 0x03, 0x01 }, new PropertyConfiguration(new Properties()).getEncryptionCiphers());
+
+        // narrowing to a single cipher
+        Properties props = new Properties();
+        props.setProperty("jcifs.client.encryptionCiphers", "AES-256-GCM");
+        assertArrayEquals(new int[] { 0x04 }, new PropertyConfiguration(props).getEncryptionCiphers());
+
+        // case and separator tolerant
+        props.setProperty("jcifs.client.encryptionCiphers", "aes_128_gcm, AES-128-CCM");
+        assertArrayEquals(new int[] { 0x02, 0x01 }, new PropertyConfiguration(props).getEncryptionCiphers());
+
+        // unknown names are rejected
+        Properties bad = new Properties();
+        bad.setProperty("jcifs.client.encryptionCiphers", "ROT13");
+        assertThrows(CIFSException.class, () -> new PropertyConfiguration(bad));
     }
 
     @Test

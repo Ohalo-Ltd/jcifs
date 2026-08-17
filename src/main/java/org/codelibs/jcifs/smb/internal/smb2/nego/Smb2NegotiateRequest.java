@@ -60,7 +60,7 @@ public class Smb2NegotiateRequest extends ServerMessageBlock2Request<Smb2Negotia
             this.capabilities |= Smb2Constants.SMB2_GLOBAL_CAP_DFS;
         }
 
-        if (config.isEncryptionEnabled() && config.getMaximumVersion() != null
+        if ((config.isEncryptionEnabled() || config.isEncryptionRequired()) && config.getMaximumVersion() != null
                 && config.getMaximumVersion().atLeast(DialectVersion.SMB300)) {
             this.capabilities |= Smb2Constants.SMB2_GLOBAL_CAP_ENCRYPTION;
         }
@@ -87,9 +87,14 @@ public class Smb2NegotiateRequest extends ServerMessageBlock2Request<Smb2Negotia
                     new PreauthIntegrityNegotiateContext(config, new int[] { PreauthIntegrityNegotiateContext.HASH_ALGO_SHA512 }, salt));
             this.preauthSalt = salt;
 
-            if (config.isEncryptionEnabled()) {
-                negoContexts.add(new EncryptionNegotiateContext(config,
-                        new int[] { EncryptionNegotiateContext.CIPHER_AES128_GCM, EncryptionNegotiateContext.CIPHER_AES128_CCM }));
+            if (config.isEncryptionEnabled() || config.isEncryptionRequired()) {
+                int[] ciphers = config.getEncryptionCiphers();
+                if (ciphers == null || ciphers.length == 0) {
+                    // MS-SMB2 2.2.3.1.2 preference order
+                    ciphers = new int[] { EncryptionNegotiateContext.CIPHER_AES256_GCM, EncryptionNegotiateContext.CIPHER_AES128_GCM,
+                            EncryptionNegotiateContext.CIPHER_AES256_CCM, EncryptionNegotiateContext.CIPHER_AES128_CCM };
+                }
+                negoContexts.add(new EncryptionNegotiateContext(config, ciphers));
             }
         }
 

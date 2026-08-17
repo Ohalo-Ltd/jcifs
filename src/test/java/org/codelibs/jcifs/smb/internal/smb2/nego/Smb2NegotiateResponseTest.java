@@ -783,6 +783,36 @@ class Smb2NegotiateResponseTest {
         assertTrue(response.getTransactionBufferSize() <= 65536);
     }
 
+    @Test
+    @DisplayName("Should reserve transform-header room in buffer sizes when encryption is negotiated")
+    void testBufferSizeCalculationsWithEncryption() throws Exception {
+        // Given
+        setResponseAsReceived(response);
+        setPrivateField(response, "dialectRevision", 0x0300);
+        setPrivateField(response, "capabilities", Smb2Constants.SMB2_GLOBAL_CAP_ENCRYPTION);
+        setPrivateField(response, "maxReadSize", 1048576);
+        setPrivateField(response, "maxWriteSize", 1048576);
+        setPrivateField(response, "maxTransactSize", 1048576);
+
+        when(mockConfig.getTransactionBufferSize()).thenReturn(65536);
+        when(mockConfig.getReceiveBufferSize()).thenReturn(1048576);
+        when(mockConfig.getSendBufferSize()).thenReturn(1048576);
+        when(mockRequest.getCapabilities()).thenReturn(Smb2Constants.SMB2_GLOBAL_CAP_ENCRYPTION);
+
+        // When
+        boolean valid = response.isValid(mockContext, mockRequest);
+
+        // Then - the maxima leave room for the 52-byte transform header, so an
+        // encrypted frame of a maximum-size message never exceeds the budget a
+        // cleartext frame would have used
+        assertTrue(valid);
+        assertTrue(response.isEncryptionSupported());
+        int budget = 65536 - 52;
+        assertEquals(budget - org.codelibs.jcifs.smb.internal.smb2.io.Smb2ReadResponse.OVERHEAD & ~0x7, response.getReceiveBufferSize());
+        assertEquals(budget - org.codelibs.jcifs.smb.internal.smb2.io.Smb2WriteRequest.OVERHEAD & ~0x7, response.getSendBufferSize());
+        assertEquals(budget - 512 & ~0x7, response.getTransactionBufferSize());
+    }
+
     @ParameterizedTest
     @DisplayName("Should validate different dialect versions")
     @MethodSource("provideDialectVersions")

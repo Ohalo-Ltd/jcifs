@@ -155,6 +155,52 @@ class Smb2NegotiateRequestTest {
     }
 
     @Test
+    @DisplayName("Requiring encryption implies advertising it")
+    void testEncryptionRequiredImpliesAdvertising() {
+        // Given - encryption not enabled, but required
+        when(mockConfig.isEncryptionEnabled()).thenReturn(false);
+        when(mockConfig.isEncryptionRequired()).thenReturn(true);
+        when(mockConfig.getMaximumVersion()).thenReturn(DialectVersion.SMB311);
+
+        // When
+        request = new Smb2NegotiateRequest(mockConfig, 0);
+
+        // Then - the capability and an encryption negotiate context are offered
+        assertEquals(Smb2Constants.SMB2_GLOBAL_CAP_ENCRYPTION, request.getCapabilities() & Smb2Constants.SMB2_GLOBAL_CAP_ENCRYPTION);
+        boolean hasEncryptionContext = false;
+        for (NegotiateContextRequest ctx : request.getNegotiateContexts()) {
+            if (ctx instanceof EncryptionNegotiateContext) {
+                hasEncryptionContext = true;
+            }
+        }
+        assertTrue(hasEncryptionContext, "An encryption negotiate context must be offered when encryption is required");
+    }
+
+    @Test
+    @DisplayName("Offers the configured encryption ciphers in preference order")
+    void testConfiguredEncryptionCiphers() {
+        // Given
+        when(mockConfig.isEncryptionEnabled()).thenReturn(true);
+        when(mockConfig.getMaximumVersion()).thenReturn(DialectVersion.SMB311);
+        when(mockConfig.getEncryptionCiphers())
+                .thenReturn(new int[] { EncryptionNegotiateContext.CIPHER_AES256_GCM, EncryptionNegotiateContext.CIPHER_AES128_GCM });
+
+        // When
+        request = new Smb2NegotiateRequest(mockConfig, 0);
+
+        // Then
+        EncryptionNegotiateContext enc = null;
+        for (NegotiateContextRequest ctx : request.getNegotiateContexts()) {
+            if (ctx instanceof EncryptionNegotiateContext e) {
+                enc = e;
+            }
+        }
+        assertNotNull(enc, "An encryption negotiate context must be offered");
+        assertArrayEquals(new int[] { EncryptionNegotiateContext.CIPHER_AES256_GCM, EncryptionNegotiateContext.CIPHER_AES128_GCM },
+                enc.getCiphers(), "The configured ciphers must be offered in the configured order");
+    }
+
+    @Test
     @DisplayName("Should generate correct dialect list")
     void testDialectGeneration() {
         // Given
