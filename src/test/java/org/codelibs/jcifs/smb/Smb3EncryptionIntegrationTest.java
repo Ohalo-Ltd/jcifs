@@ -13,6 +13,10 @@
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
+/*
+ * Added by Ohalo Ltd on 2026-08-17: integration coverage for every negotiated cipher against a real
+ * Samba server.
+ */
 package org.codelibs.jcifs.smb;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;

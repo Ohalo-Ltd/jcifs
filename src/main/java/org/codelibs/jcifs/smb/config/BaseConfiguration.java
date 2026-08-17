@@ -15,6 +15,10 @@
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
+/*
+ * Modified by Ohalo Ltd on 2026-08-17: default the encryptionRequired and encryptionCiphers
+ * properties, and parse cipher names into MS-SMB2 cipher identifiers.
+ */
 package org.codelibs.jcifs.smb.config;
 
 import java.io.UnsupportedEncodingException;

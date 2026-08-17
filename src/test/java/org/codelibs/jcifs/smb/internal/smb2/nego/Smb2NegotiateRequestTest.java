@@ -1,3 +1,7 @@
+/*
+ * Modified by Ohalo Ltd on 2026-08-17: cover offering the configured cipher list in negotiation.
+ */
+
 package org.codelibs.jcifs.smb.internal.smb2.nego;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;

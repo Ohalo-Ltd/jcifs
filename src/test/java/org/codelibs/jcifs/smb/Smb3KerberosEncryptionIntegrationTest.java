@@ -13,6 +13,10 @@
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
+/*
+ * Added by Ohalo Ltd on 2026-08-17: integration coverage for SMB 3.x encryption over Kerberos
+ * against a Samba AD DC.
+ */
 package org.codelibs.jcifs.smb;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;

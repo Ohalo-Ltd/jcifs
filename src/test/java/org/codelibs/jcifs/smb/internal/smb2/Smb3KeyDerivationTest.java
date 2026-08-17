@@ -1,3 +1,7 @@
+/*
+ * Modified by Ohalo Ltd on 2026-08-17: cover key derivation at both 16- and 32-byte key lengths.
+ */
+
 package org.codelibs.jcifs.smb.internal.smb2;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;

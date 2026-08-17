@@ -1,3 +1,8 @@
+/*
+ * Modified by Ohalo Ltd on 2026-08-17: cover the transform-header overhead in the negotiated
+ * maxima.
+ */
+
 package org.codelibs.jcifs.smb.internal.smb2.nego;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
