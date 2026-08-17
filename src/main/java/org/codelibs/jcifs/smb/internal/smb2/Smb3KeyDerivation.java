@@ -15,6 +15,10 @@
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
+/*
+ * Modified by Ohalo Ltd on 2026-08-17: derive encryption and decryption keys of a caller-supplied
+ * length, so that the AES-256 ciphers get 32-byte keys.
+ */
 package org.codelibs.jcifs.smb.internal.smb2;
 
 import java.nio.charset.StandardCharsets;

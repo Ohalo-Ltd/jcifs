@@ -1,3 +1,7 @@
+/*
+ * Modified by Ohalo Ltd on 2026-08-17: cover the corrected protocol id wire order and AAD layout.
+ */
+
 package org.codelibs.jcifs.smb.internal.smb2;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;

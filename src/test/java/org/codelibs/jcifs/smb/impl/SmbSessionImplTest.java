@@ -1,3 +1,7 @@
+/*
+ * Modified by Ohalo Ltd on 2026-08-17: cover deriving the encryption context from the session key.
+ */
+
 package org.codelibs.jcifs.smb.impl;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;

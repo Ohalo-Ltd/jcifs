@@ -1,3 +1,8 @@
+/*
+ * Modified by Ohalo Ltd on 2026-08-17: cover the encryptionRequired and encryptionCiphers
+ * properties.
+ */
+
 package org.codelibs.jcifs.smb.config;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
