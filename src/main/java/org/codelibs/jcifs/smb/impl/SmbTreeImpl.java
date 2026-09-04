@@ -20,6 +20,11 @@
  * which means not chaining a request onto the tree connect that reveals it.
  */
 
+/*
+ * Modified by Ohalo Ltd on 2026-09-04: Fixes java.util.ConcurrentModificationException when accessing DFS referral
+ * data using multiple threads.
+ */
+
 package org.codelibs.jcifs.smb.impl;
 
 import java.io.IOException;
