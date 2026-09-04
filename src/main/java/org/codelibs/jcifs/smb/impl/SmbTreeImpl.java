@@ -16,6 +16,11 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
+/*
+ * Modified by Ohalo Ltd on 2026-09-04: Fixes java.util.ConcurrentModificationException when accessing DFS referral
+ * data using multiple threads.
+ */
+
 package org.codelibs.jcifs.smb.impl;
 
 import java.io.IOException;
