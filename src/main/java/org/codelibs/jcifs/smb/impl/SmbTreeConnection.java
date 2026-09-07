@@ -15,6 +15,11 @@
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
+/*
+ * Modified by Ohalo Ltd on 2026-09-07: reuse the DFS referral the locator already
+ * holds in resolveDfs0 when the request path misses the per-tree referral cache, so a
+ * concurrent crawl of a DFS namespace does not disconnect the shared tree.
+ */
 package org.codelibs.jcifs.smb.impl;
 
 import java.io.IOException;

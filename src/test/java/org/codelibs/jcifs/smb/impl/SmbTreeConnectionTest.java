@@ -1,3 +1,7 @@
+/*
+ * Modified by Ohalo Ltd on 2026-09-07: cover resolveDfs0 reusing a link-less referral
+ * the locator holds when the request path misses the per-tree referral cache.
+ */
 package org.codelibs.jcifs.smb.impl;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
