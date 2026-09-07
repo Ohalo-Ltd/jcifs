@@ -670,6 +670,15 @@ class SmbTreeConnection {
                 if (dr == null && loc.getDfsReferral() != null && loc.getDfsReferral().getLink() != null) {
                     dr = t.getTreeReferral(loc.getDfsReferral().getLink());
                 }
+                if (dr == null && loc.getDfsReferral() != null) {
+                    // The locator was already rewritten by its referral when the tree was connected, so the
+                    // request path no longer matches the cache, which is keyed by the path as it was requested.
+                    // A standalone referral carries no link to look up instead. Reuse the referral the locator
+                    // holds: resolving from scratch with the rewritten share and path cannot succeed and ends in
+                    // "No referral but in domain DFS", whose retry disconnects the tree shared by every user of
+                    // this share.
+                    dr = loc.getDfsReferral();
+                }
                 if (dr != null) {
                     if (log.isDebugEnabled()) {
                         log.debug(String.format("Need to adjust request path %s (full: %s) -> %s", rpath, rfullpath, dr));
