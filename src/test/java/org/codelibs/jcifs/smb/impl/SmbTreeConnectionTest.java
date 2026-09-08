@@ -1,3 +1,7 @@
+/*
+ * Modified by Ohalo Ltd on 2026-09-07: cover resolveDfs0 reusing a link-less referral
+ * the locator holds when the request path misses the per-tree referral cache.
+ */
 package org.codelibs.jcifs.smb.impl;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -12,12 +16,15 @@ import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Field;
@@ -27,11 +34,13 @@ import java.util.EnumSet;
 import org.codelibs.jcifs.smb.CIFSContext;
 import org.codelibs.jcifs.smb.Configuration;
 import org.codelibs.jcifs.smb.Credentials;
+import org.codelibs.jcifs.smb.DfsReferralData;
 import org.codelibs.jcifs.smb.DfsResolver;
 import org.codelibs.jcifs.smb.RuntimeCIFSException;
 import org.codelibs.jcifs.smb.SmbResourceLocator;
 import org.codelibs.jcifs.smb.SmbTreeHandle;
 import org.codelibs.jcifs.smb.internal.CommonServerMessageBlockRequest;
+import org.codelibs.jcifs.smb.internal.RequestWithPath;
 import org.codelibs.jcifs.smb.internal.CommonServerMessageBlockResponse;
 import org.codelibs.jcifs.smb.internal.smb1.com.SmbComClose;
 import org.junit.jupiter.api.BeforeEach;
@@ -398,5 +407,51 @@ class SmbTreeConnectionTest {
         setTree(c, tree);
 
         assertEquals("MixedCaseShare", c.getConnectedShare());
+    }
+
+    @Test
+    @DisplayName("ensureDFSResolved reuses a link-less referral the locator holds rather than failing")
+    void ensureDFSResolved_reusesLinklessLocatorReferral() throws Exception {
+        // A tree already in a domain-based DFS. Connecting it rewrote the locator's path by its
+        // referral, so the request path no longer matches the per-tree referral cache, which is
+        // keyed by the path as it was requested. The referral the locator holds carries no link, so
+        // the link fallback cannot find it either. The referral the locator already holds is the one
+        // to use: resolving from scratch with the rewritten share and path finds nothing and throws
+        // "No referral but in domain DFS", and that failure's retry disconnects the tree every user
+        // of this share depends on.
+        SmbTreeConnection c = spy(newConn());
+
+        SmbTreeImpl tree = mock(SmbTreeImpl.class);
+        when(tree.acquire(false)).thenReturn(tree);
+        when(tree.isInDomainDfs()).thenReturn(true);
+        when(tree.getTreeReferral(anyString())).thenReturn(null);
+        setTree(c, tree);
+
+        SmbTreeHandleImpl handle = mock(SmbTreeHandleImpl.class);
+        SmbSessionImpl session = mock(SmbSessionImpl.class);
+        SmbTransportImpl transport = mock(SmbTransportImpl.class);
+        when(handle.getSession()).thenReturn(session);
+        when(session.getTransport()).thenReturn(transport);
+        doReturn(handle).when(c).connectWrapException(any());
+
+        DfsReferralData referral = mock(DfsReferralData.class);
+        when(referral.getLink()).thenReturn(null);
+
+        SmbResourceLocatorImpl loc = mock(SmbResourceLocatorImpl.class);
+        when(loc.getDfsReferral()).thenReturn(referral);
+        when(loc.handleDFSReferral(referral, "\\seed\\folder-1\\")).thenReturn("\\seed\\folder-1\\");
+
+        RequestWithPath request = mock(RequestWithPath.class);
+        when(request.getPath()).thenReturn("\\seed\\folder-1\\");
+        when(request.getFullUNCPath()).thenReturn("\\dc01\\Data\\seed\\folder-1\\");
+
+        SmbResourceLocator resolved = c.ensureDFSResolved(loc, request);
+
+        assertSame(loc, resolved);
+        verify(loc).handleDFSReferral(referral, "\\seed\\folder-1\\");
+        verify(request).setPath("\\seed\\folder-1\\");
+        // No fresh resolution, and the shared tree is left connected.
+        verifyNoInteractions(dfsResolver);
+        verify(c, never()).disconnect(anyBoolean());
     }
 }

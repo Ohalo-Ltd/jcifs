@@ -15,6 +15,11 @@
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
+/*
+ * Modified by Ohalo Ltd on 2026-09-07: reuse the DFS referral the locator already
+ * holds in resolveDfs0 when the request path misses the per-tree referral cache, so a
+ * concurrent crawl of a DFS namespace does not disconnect the shared tree.
+ */
 package org.codelibs.jcifs.smb.impl;
 
 import java.io.IOException;
@@ -669,6 +674,15 @@ class SmbTreeConnection {
                 DfsReferralData dr = t.getTreeReferral(rpath);
                 if (dr == null && loc.getDfsReferral() != null && loc.getDfsReferral().getLink() != null) {
                     dr = t.getTreeReferral(loc.getDfsReferral().getLink());
+                }
+                if (dr == null && loc.getDfsReferral() != null) {
+                    // The locator was already rewritten by its referral when the tree was connected, so the
+                    // request path no longer matches the cache, which is keyed by the path as it was requested.
+                    // A standalone referral carries no link to look up instead. Reuse the referral the locator
+                    // holds: resolving from scratch with the rewritten share and path cannot succeed and ends in
+                    // "No referral but in domain DFS", whose retry disconnects the tree shared by every user of
+                    // this share.
+                    dr = loc.getDfsReferral();
                 }
                 if (dr != null) {
                     if (log.isDebugEnabled()) {
