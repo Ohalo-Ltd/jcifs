@@ -298,7 +298,7 @@ class SmbResourceLocatorImplTest {
     }
 
     @Test
-    @DisplayName("overlaps requires same address and canonical URL prefix match")
+    @DisplayName("overlaps requires the same address")
     void testOverlaps() throws Exception {
         UniAddress a = mock(UniAddress.class);
         when(nsc.getAllByName(anyString(), anyBoolean())).thenReturn(new Address[] { a });
@@ -308,6 +308,30 @@ class SmbResourceLocatorImplTest {
 
         SmbResourceLocatorImpl other = locator("smb://server/share/other");
         assertFalse(base.overlaps(other));
+
+        UniAddress b = mock(UniAddress.class);
+        when(nsc.getAllByName(eq("other"), anyBoolean())).thenReturn(new Address[] { b });
+        assertFalse(base.overlaps(locator("smb://other/share/dir/file")));
+    }
+
+    @ParameterizedTest
+    @DisplayName("overlaps matches whole path elements, ignoring authority and trailing separators")
+    @CsvSource({
+            // parent/child and identical paths overlap
+            "smb://server/share/dir,smb://server/share/dir/file,true", "smb://server/share/dir/file,smb://server/share/dir,true",
+            "smb://server/share/dir/,smb://server/share/dir/file,true", "smb://server/share/a/b,smb://server/share/a/b/,true",
+            "smb://server/share/file,smb://server/share/file,true", "smb://server/share/file,smb://server/share/FILE,true",
+            "smb://server/share,smb://server/share/dir/file,true", "smb://server/share/,smb://server/share/dir/file,true",
+            // the authority is not part of the path, the address comparison covers the server
+            "smb://user@server/share/a,smb://server/share/a/b,true", "smb://server:445/share/a,smb://server/share/a/b,true",
+            // siblings sharing a name prefix are not parent/child
+            "smb://server/share/file,smb://server/share/file123,false", "smb://server/share/file123,smb://server/share/file,false",
+            "smb://server/share/dir,smb://server/share/dir2/,false", "smb://server/share/dir/,smb://server/share/dir2/,false",
+            "smb://server/share,smb://server/share2/file,false", "smb://server/share/other,smb://server/share/dir,false" })
+    void testOverlapsPathBoundaries(String left, String right, boolean expected) throws Exception {
+        UniAddress a = mock(UniAddress.class);
+        when(nsc.getAllByName(anyString(), anyBoolean())).thenReturn(new Address[] { a });
+        assertEquals(expected, locator(left).overlaps(locator(right)));
     }
 
     @Test
@@ -420,5 +444,57 @@ class SmbResourceLocatorImplTest {
         assertEquals("/share/sub/child", base2.getURLPath());
         assertEquals("\\sub\\child", base2.getUNCPath());
         assertEquals("share", base2.getShare());
+    }
+
+    @Test
+    @DisplayName("resolveInContext separates the name from a context path without a trailing slash (issue #83)")
+    void testResolveInContextWithoutTrailingSlash() {
+        SmbResourceLocatorImpl base = locator("smb://server/share/nested/a.txt");
+        SmbResourceLocator context = mock(SmbResourceLocator.class);
+        when(context.getShare()).thenReturn("share");
+        when(context.getDfsReferral()).thenReturn(null);
+        // a resource obtained through resolve("nested") carries no trailing slash
+        when(context.getUNCPath()).thenReturn("\\nested");
+        when(context.getURLPath()).thenReturn("/share/nested");
+        when(context.getServer()).thenReturn("server");
+
+        base.resolveInContext(context, "a.txt");
+        assertEquals("/share/nested/a.txt", base.getURLPath());
+        assertEquals("\\nested\\a.txt", base.getUNCPath());
+        assertEquals("a.txt", base.getName());
+        assertEquals("share", base.getShare());
+    }
+
+    @Test
+    @DisplayName("resolveInContext keeps a share root context without a trailing slash separated")
+    void testResolveInContextShareRootWithoutTrailingSlash() {
+        SmbResourceLocatorImpl base = locator("smb://server/share/dir");
+        SmbResourceLocator context = mock(SmbResourceLocator.class);
+        when(context.getShare()).thenReturn("share");
+        when(context.getDfsReferral()).thenReturn(null);
+        when(context.getUNCPath()).thenReturn("\\");
+        when(context.getURLPath()).thenReturn("/share");
+        when(context.getServer()).thenReturn("server");
+
+        base.resolveInContext(context, "dir/");
+        assertEquals("/share/dir/", base.getURLPath());
+        assertEquals("\\dir\\", base.getUNCPath());
+        assertEquals("share", base.getShare());
+    }
+
+    @Test
+    @DisplayName("resolveInContext does not duplicate the separator of an absolute name")
+    void testResolveInContextAbsoluteName() {
+        SmbResourceLocatorImpl base = locator("smb://server/share/zig/zag");
+        SmbResourceLocator context = mock(SmbResourceLocator.class);
+        when(context.getShare()).thenReturn("share");
+        when(context.getDfsReferral()).thenReturn(null);
+        when(context.getUNCPath()).thenReturn("\\zig\\zag");
+        when(context.getURLPath()).thenReturn("/share/zig/zag");
+        when(context.getServer()).thenReturn("server");
+
+        base.resolveInContext(context, "/");
+        assertEquals("/share/zig/zag/", base.getURLPath());
+        assertEquals("\\zig\\zag\\", base.getUNCPath());
     }
 }

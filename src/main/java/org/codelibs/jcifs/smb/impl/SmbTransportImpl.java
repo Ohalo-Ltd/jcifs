@@ -17,8 +17,8 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 /*
- * Modified by Ohalo Ltd on 2026-08-17: encrypt outbound messages, decrypt inbound transform-header
- * frames, and resolve a session's encryption context by session id.
+ * Modified by Ohalo Ltd on 2026-10-01: derive the AES-256 encryption keys from the full session key
+ * (MS-SMB2 Session.FullSessionKey) instead of its 16-byte truncation.
  */
 
 package org.codelibs.jcifs.smb.impl;
@@ -38,8 +38,8 @@ import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.ListIterator;
-import java.util.Locale;
 import java.util.Map;
+import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
@@ -77,15 +77,18 @@ import org.codelibs.jcifs.smb.internal.smb1.trans.SmbComTransactionResponse;
 import org.codelibs.jcifs.smb.internal.smb1.trans2.Trans2GetDfsReferral;
 import org.codelibs.jcifs.smb.internal.smb1.trans2.Trans2GetDfsReferralResponse;
 import org.codelibs.jcifs.smb.internal.smb2.ServerMessageBlock2;
+import org.codelibs.jcifs.smb.internal.smb2.Smb2TransformHeader;
+import org.codelibs.jcifs.smb.internal.util.SMBUtil;
 import org.codelibs.jcifs.smb.internal.smb2.ServerMessageBlock2Request;
 import org.codelibs.jcifs.smb.internal.smb2.ServerMessageBlock2Response;
 import org.codelibs.jcifs.smb.internal.smb2.Smb2Constants;
 import org.codelibs.jcifs.smb.internal.smb2.Smb2EncryptionContext;
-import org.codelibs.jcifs.smb.internal.smb2.Smb2TransformHeader;
+import org.codelibs.jcifs.smb.internal.smb2.Smb2SymlinkErrorResponse;
 import org.codelibs.jcifs.smb.internal.smb2.Smb3KeyDerivation;
 import org.codelibs.jcifs.smb.internal.smb2.io.Smb2ReadResponse;
 import org.codelibs.jcifs.smb.internal.smb2.ioctl.Smb2IoctlRequest;
 import org.codelibs.jcifs.smb.internal.smb2.ioctl.Smb2IoctlResponse;
+import org.codelibs.jcifs.smb.internal.smb2.lock.Smb2OplockBreakAcknowledgment;
 import org.codelibs.jcifs.smb.internal.smb2.lock.Smb2OplockBreakNotification;
 import org.codelibs.jcifs.smb.internal.smb2.nego.EncryptionNegotiateContext;
 import org.codelibs.jcifs.smb.internal.smb2.nego.Smb2NegotiateRequest;
@@ -123,23 +126,23 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
     private final byte[] sbuf = new byte[1024]; /* small local buffer */
     private long sessionExpiration;
     private final List<SmbSessionImpl> sessions = new LinkedList<>();
+
     /**
-     * Sessions by server-assigned session ID, for looking up the encryption
-     * context of a frame on the send and receive paths. Concurrent map because
-     * lookups happen on the transport thread while registration happens from
-     * session-setup callers; never a linear scan on the per-frame hot path.
+     * Sessions indexed by their server-assigned id, for resolving the key of an inbound SMB2 TRANSFORM_HEADER.
+     *
+     * <p>
+     * Deliberately a concurrent map rather than a scan of {@link #sessions} under the transport monitor: the receive
+     * thread performs this lookup while a caller may be holding that monitor inside session setup, waiting for the
+     * very response the receive thread is trying to deliver.
+     * </p>
      */
     private final Map<Long, SmbSessionImpl> sessionsById = new ConcurrentHashMap<>();
 
-    /**
-     * Decrypted payload of the encrypted frame currently being received.
-     * Encrypted frames must be decrypted in peekKey - the MessageId needed for
-     * correlation is inside the ciphertext - so the plaintext is buffered here
-     * and doRecvSMB2/doSkip consume it instead of the socket. Only touched on
-     * the receive path, which is single-threaded (guarded by inLock).
-     */
-    private byte[] pendingPlaintext;
-    private int pendingPlaintextOffset;
+    /** Decrypted payload of the transform message currently being dispatched, or null. */
+    private byte[] transformPayload;
+
+    /** Read cursor into {@link #transformPayload}. */
+    private int transformPayloadOffset;
 
     private String tconHostName = null;
 
@@ -221,6 +224,30 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
     public boolean isFailed() {
         final Socket s = this.socket;
         return super.isFailed() || s == null || s.isClosed();
+    }
+
+    /**
+     * Whether this transport is still to be connected: it was just created, or another caller is connecting it now,
+     * and nothing has failed. {@link #isFailed()} is true for it as well, because it has no socket yet, but nothing
+     * is wrong with it - it simply has nothing negotiated that could be checked.
+     *
+     * @return whether the transport has not connected yet and has not failed
+     */
+    boolean isConnectionPending() {
+        final int st = this.state;
+        return (st == 0 || st == 1) && this.negotiated == null;
+    }
+
+    /**
+     * Whether a caller with this context and signing requirement would have created this transport the same way.
+     *
+     * @param tc the caller's context
+     * @param forceSigning whether the caller enforces signing
+     * @return whether the transport was created from the same configuration with the same signing requirement
+     */
+    boolean wasCreatedFor(final CIFSContext tc, final boolean forceSigning) {
+        return this.transportContext.getConfig() == tc.getConfig()
+                && this.signingEnforced == (forceSigning || tc.getConfig().isSigningEnforced());
     }
 
     @Override
@@ -401,42 +428,6 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
         }
         this.sessions.add(ssn);
         return ssn;
-    }
-
-    /**
-     * Register a session under its server-assigned session ID, making its
-     * encryption context discoverable by {@link #encryptionContextFor(long)}.
-     *
-     * @param sessionId server-assigned session ID
-     * @param session the session
-     */
-    void registerSession(final long sessionId, final SmbSessionImpl session) {
-        if (sessionId != 0) {
-            this.sessionsById.put(sessionId, session);
-        }
-    }
-
-    /**
-     * Remove a session from the session-ID map, e.g. on logoff.
-     *
-     * @param sessionId server-assigned session ID
-     */
-    void unregisterSession(final long sessionId) {
-        if (sessionId != 0) {
-            this.sessionsById.remove(sessionId);
-        }
-    }
-
-    /**
-     * Look up the encryption context for a session ID.
-     *
-     * @param sessionId server-assigned session ID
-     * @return the session's encryption context, or null if the session is
-     *         unknown or has no encryption context
-     */
-    Smb2EncryptionContext encryptionContextFor(final long sessionId) {
-        final SmbSessionImpl sess = this.sessionsById.get(sessionId);
-        return sess != null ? sess.getEncryptionContext() : null;
     }
 
     boolean matches(final Address addr, final int prt, final InetAddress laddr, final int lprt, String hostName) {
@@ -811,10 +802,12 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
         } catch (final Exception e) {
             log.debug("Exception in disconnect", e);
         } finally {
+            // Cleared only here: the tree-disconnect and logoff above still have to resolve their session in
+            // order to encrypt themselves on an encrypted session.
+            this.sessionsById.clear();
             this.socket = null;
             this.digest = null;
             this.tconHostName = null;
-            this.sessionsById.clear();
             this.transportContext.getTransportPool().removeTransport(this);
         }
         return wasInUse;
@@ -822,7 +815,12 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
 
     @Override
     protected long makeKey(final Request request) throws IOException {
-        long m = this.mid.incrementAndGet() - 1;
+        // MS-SMB2 3.2.4.1.3: a request owns one message id for every credit it charges, not one per request. Taking
+        // a single id for a multi-credit request leaves the server expecting ids that never arrive, and it stops
+        // answering once its receive window has moved past them. The charge is stamped by setupRequest before this
+        // runs, so it is already zero on a connection that never negotiated multi-credit.
+        final long charge = request instanceof final ServerMessageBlock2 smb2Request ? Math.max(1, smb2Request.getCreditCharge()) : 1;
+        long m = this.mid.getAndAdd(charge);
         if (!this.smb2) {
             m = m % 32000;
         }
@@ -832,6 +830,8 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
 
     @Override
     protected Long peekKey() throws IOException {
+        this.transformPayload = null;
+        this.transformPayloadOffset = 0;
         do {
             if (readn(this.in, this.sbuf, 0, 4) < 4) {
                 return null;
@@ -869,11 +869,16 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
 
             if (this.sbuf[0] == (byte) 0x00 && this.sbuf[4] == (byte) 0xFD && this.sbuf[5] == (byte) 'S' && this.sbuf[6] == (byte) 'M'
                     && this.sbuf[7] == (byte) 'B') {
-                // encrypted frame: the SMB2 header - including the MessageId needed
-                // to correlate the response - is inside the ciphertext, so it must
-                // be decrypted here before correlation is possible
-                this.smb2 = true;
-                return peekEncrypted();
+                // SMB2 TRANSFORM_HEADER: the message id to dispatch on is inside the ciphertext, so the whole
+                // message has to be read and decrypted before a key can be returned.
+                return peekTransformedKey();
+            }
+
+            if (this.sbuf[0] == (byte) 0x00 && this.sbuf[4] == (byte) 0xFC && this.sbuf[5] == (byte) 'S' && this.sbuf[6] == (byte) 'M'
+                    && this.sbuf[7] == (byte) 'B') {
+                // SMB2 COMPRESSION_TRANSFORM_HEADER, for the same reason as the encrypted case: the
+                // message id is inside the compressed data.
+                return peekCompressedKey();
             }
 
             if (this.sbuf[0] == (byte) 0x00 && this.sbuf[1] == (byte) 0x00 && this.sbuf[4] == (byte) 0xFF && this.sbuf[5] == (byte) 'S'
@@ -904,118 +909,6 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
         return (long) Encdec.dec_uint16le(this.sbuf, 34) & 0xFFFF;
     }
 
-    /**
-     * Complete reading an encrypted frame, decrypt it and stage the plaintext
-     * so the regular SMB2 receive path can consume it.
-     *
-     * On return, sbuf carries the plaintext size and the decrypted SMB2 header
-     * at the offsets the cleartext path expects, and the remaining body is
-     * served from the buffered plaintext.
-     *
-     * @return the MessageId of the decrypted message, or null on EOF
-     * @throws IOException if the frame is invalid or cannot be decrypted; the
-     *             receive loop reacts by disconnecting the transport
-     */
-    private Long peekEncrypted() throws IOException {
-        // 4 bytes NBSS prefix + 32 header bytes were already read; complete the
-        // 52-byte transform header
-        final int have = 4 + SmbConstants.SMB1_HEADER_LENGTH;
-        final int need = 4 + Smb2TransformHeader.TRANSFORM_HEADER_SIZE - have;
-        if (readn(this.in, this.sbuf, have, need) < need) {
-            return null;
-        }
-
-        final int size = (this.sbuf[1] & 0xFF) << 16 | (this.sbuf[2] & 0xFF) << 8 | this.sbuf[3] & 0xFF;
-        if (size < Smb2TransformHeader.TRANSFORM_HEADER_SIZE + Smb2Constants.SMB2_HEADER_LENGTH) {
-            throw new IOException("Invalid encrypted frame size: " + size);
-        }
-        final int cipherLen = size - Smb2TransformHeader.TRANSFORM_HEADER_SIZE;
-
-        final Smb2TransformHeader th;
-        try {
-            th = Smb2TransformHeader.decode(this.sbuf, 4);
-        } catch (final IllegalArgumentException e) {
-            throw new IOException("Invalid transform header", e);
-        }
-
-        // MS-SMB2 3.2.5.1.1.1: the frame must be exactly OriginalMessageSize
-        // plus the transform header, and the plaintext must be a sane message
-        final int origSize = th.getOriginalMessageSize();
-        final int maximumBufferSize = getContext().getConfig().getMaximumBufferSize();
-        if (origSize != cipherLen || origSize < Smb2Constants.SMB2_HEADER_LENGTH || origSize > maximumBufferSize) {
-            throw new IOException(String.format("Invalid encrypted message size %d (frame payload %d)", origSize, cipherLen));
-        }
-
-        final Smb2EncryptionContext ectx = encryptionContextFor(th.getSessionId());
-        if (ectx == null) {
-            throw new IOException("Received encrypted message for unknown session");
-        }
-
-        final byte[] frame = new byte[Smb2TransformHeader.TRANSFORM_HEADER_SIZE + cipherLen];
-        System.arraycopy(this.sbuf, 4, frame, 0, Smb2TransformHeader.TRANSFORM_HEADER_SIZE);
-        if (readn(this.in, frame, Smb2TransformHeader.TRANSFORM_HEADER_SIZE, cipherLen) < cipherLen) {
-            return null;
-        }
-
-        final byte[] plain;
-        try {
-            plain = ectx.decryptMessage(frame);
-        } catch (final CIFSException e) {
-            // never fall back to processing an undecryptable frame as cleartext
-            throw new IOException("Failed to decrypt message", e);
-        }
-
-        // present the decrypted message to the existing receive path: sbuf gets
-        // the plaintext size and SMB2 header at the usual offsets, the body is
-        // served from the buffered plaintext by readBodyBytes/skipBodyBytes
-        this.sbuf[0] = 0;
-        this.sbuf[1] = (byte) (plain.length >> 16 & 0xFF);
-        this.sbuf[2] = (byte) (plain.length >> 8 & 0xFF);
-        this.sbuf[3] = (byte) (plain.length & 0xFF);
-        System.arraycopy(plain, 0, this.sbuf, 4, Smb2Constants.SMB2_HEADER_LENGTH);
-        this.pendingPlaintext = plain;
-        this.pendingPlaintextOffset = Smb2Constants.SMB2_HEADER_LENGTH;
-
-        return Encdec.dec_uint64le(plain, 24);
-    }
-
-    /**
-     * Read message body bytes, from the buffered plaintext of a decrypted
-     * frame if one is pending, directly from the socket otherwise.
-     *
-     * @param b destination buffer
-     * @param off destination offset
-     * @param len number of bytes to read
-     * @return number of bytes read
-     */
-    private int readBodyBytes(final byte[] b, final int off, final int len) throws IOException {
-        if (this.pendingPlaintext != null) {
-            final int remain = this.pendingPlaintext.length - this.pendingPlaintextOffset;
-            if (len > remain) {
-                throw new IOException(String.format("Encrypted message payload exhausted, need %d have %d", len, remain));
-            }
-            System.arraycopy(this.pendingPlaintext, this.pendingPlaintextOffset, b, off, len);
-            this.pendingPlaintextOffset += len;
-            return len;
-        }
-        return readn(this.in, b, off, len);
-    }
-
-    /**
-     * Skip message body bytes, mirroring {@link #readBodyBytes}.
-     *
-     * @param n number of bytes to skip
-     * @return number of bytes skipped
-     */
-    private long skipBodyBytes(final long n) throws IOException {
-        if (this.pendingPlaintext != null) {
-            final long skip = Math.min(n, this.pendingPlaintext.length - (long) this.pendingPlaintextOffset);
-            this.pendingPlaintextOffset += (int) skip;
-            return skip;
-        }
-        return this.in.skip(n);
-    }
-
     @Override
     protected void doSend(final Request request) throws IOException {
 
@@ -1023,19 +916,12 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
         final byte[] buffer = this.getContext().getBufferCache().getBuffer();
         try {
             // synchronize around encode and write so that the ordering for SMB1 signing can be maintained
-            // (encryption nonce generation also stays in write order under this lock)
             synchronized (this.outLock) {
-                final Smb2EncryptionContext ectx = resolveEncryptionContext(smb);
-                final long sessionId;
-                if (ectx != null) {
-                    // encrypted messages are never signed - the transform header's
-                    // AEAD tag protects them (MS-SMB2 3.2.4.1.1)
-                    smb.setDigest(null);
-                    sessionId = ((ServerMessageBlock2) smb).getSessionId();
-                } else {
-                    sessionId = 0;
-                }
                 final int n = smb.encode(buffer, 4);
+                // The direct TCP session message length is 24 bits wide (MS-SMB2 2.1). Masking it to 16 leaves a
+                // message of exactly 64 KiB announcing a length of zero, and everything after it on the connection
+                // is then read from the wrong offset.
+                Encdec.enc_uint32be(n & 0xFFFFFF, buffer, 0); /* 4 byte session message header */
                 if (log.isTraceEnabled()) {
                     do {
                         log.trace(smb.toString());
@@ -1043,15 +929,14 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
                     log.trace(Hexdump.toHexString(buffer, 4, n));
 
                 }
-                if (ectx != null) {
-                    sendEncrypted(ectx, sessionId, buffer, n);
-                } else {
-                    Encdec.enc_uint32be(n & 0xFFFF, buffer, 0); /* 4 byte session message header */
-                    /*
-                     * For some reason this can sometimes get broken up into another
-                     * "NBSS Continuation Message" frame according to WireShark
-                     */
+                /*
+                 * For some reason this can sometimes get broken up into another
+                 * "NBSS Continuation Message" frame according to WireShark
+                 */
 
+                if (smb instanceof final ServerMessageBlock2 smb2Message && smb2Message.isEncrypt()) {
+                    writeEncrypted(smb2Message, buffer, n);
+                } else {
                     this.out.write(buffer, 0, 4 + n);
                     this.out.flush();
                 }
@@ -1062,51 +947,41 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
     }
 
     /**
-     * Decide whether an outbound message must be encrypted and resolve the
-     * context to encrypt it with. The owning session decides, based on the
-     * session- and share-level encryption requirements.
+     * Wraps an already-encoded SMB2 message (including any compounded messages) in an SMB2 TRANSFORM_HEADER and
+     * writes it.
      *
-     * @param smb the outbound message (head of a compound chain)
-     * @return the encryption context to use, or null to send in cleartext
+     * <p>
+     * Called with {@link #outLock} held. The encoded message starts at {@code buffer[4]}; there is not enough room
+     * ahead of it for the 52-byte transform header, so the wrapped message is built separately.
+     * </p>
      */
-    private Smb2EncryptionContext resolveEncryptionContext(final CommonServerMessageBlock smb) {
-        if (!this.smb2 || !(smb instanceof ServerMessageBlock2 s2) || s2.isEncryptionExempt()) {
-            return null;
+    private void writeEncrypted(final ServerMessageBlock2 message, final byte[] buffer, final int n) throws IOException {
+        final long sessionId = message.getSessionId();
+        final SmbSessionImpl session = getSessionById(sessionId);
+        if (session == null) {
+            throw new IOException("Cannot encrypt request for unknown session 0x" + Long.toHexString(sessionId));
         }
-        final long sessionId = s2.getSessionId();
-        if (sessionId == 0) {
-            return null;
+        final Smb2EncryptionContext encryptionContext = session.getEncryptionContext();
+        if (encryptionContext == null) {
+            throw new IOException("Encryption is required but session 0x" + Long.toHexString(sessionId) + " has no encryption context");
         }
-        final SmbSessionImpl sess = this.sessionsById.get(sessionId);
-        if (sess == null) {
-            return null;
-        }
-        return sess.getEncryptionContextFor(s2.getTreeId());
-    }
 
-    /**
-     * Encrypt the encoded message and write it as a transform-header frame.
-     *
-     * @param ectx the session's encryption context
-     * @param sessionId session the message belongs to
-     * @param buffer buffer holding the encoded plaintext at offset 4
-     * @param len plaintext length
-     */
-    private void sendEncrypted(final Smb2EncryptionContext ectx, final long sessionId, final byte[] buffer, final int len)
-            throws IOException {
-        final byte[] plain = new byte[len];
-        System.arraycopy(buffer, 4, plain, 0, len);
-        final byte[] frame;
+        // Encrypt straight into the frame so that the session header and the wrapped message reach the socket in
+        // a single write, as they do on the unencrypted path.
+        final int wireLength = Smb2TransformHeader.TRANSFORM_HEADER_SIZE + n;
+        final byte[] framed = new byte[4 + wireLength];
+        framed[0] = 0;
+        framed[1] = (byte) (wireLength >> 16);
+        framed[2] = (byte) (wireLength >> 8);
+        framed[3] = (byte) wireLength;
+
         try {
-            frame = ectx.encryptMessage(plain, sessionId);
+            encryptionContext.encryptMessage(buffer, 4, n, sessionId, framed, 4);
         } catch (final CIFSException e) {
             throw new IOException("Failed to encrypt message", e);
         }
-        final byte[] wire = new byte[4 + frame.length];
-        // encrypted frames can exceed 0xFFFF, the direct TCP length field is 3 bytes
-        Encdec.enc_uint32be(frame.length & 0xFFFFFF, wire, 0);
-        System.arraycopy(frame, 0, wire, 4, frame.length);
-        this.out.write(wire, 0, wire.length);
+
+        this.out.write(framed, 0, framed.length);
         this.out.flush();
     }
 
@@ -1117,7 +992,11 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
 
         CommonServerMessageBlockRequest curHead = request;
 
-        final int maxSize = getContext().getConfig().getMaximumBufferSize();
+        int maxSize = getContext().getConfig().getMaximumBufferSize();
+        if (request instanceof final ServerMessageBlock2 smb2Request && smb2Request.isEncrypt()) {
+            // The wrapped message must still fit: the transform header is prepended to the whole compound chain.
+            maxSize -= Smb2TransformHeader.TRANSFORM_HEADER_SIZE;
+        }
 
         while (curHead != null) {
             CommonServerMessageBlockRequest nextHead = null;
@@ -1335,6 +1214,236 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
         }
     }
 
+    /**
+     * Reads and decrypts a complete SMB2 TRANSFORM_HEADER message, then presents the plaintext to the normal
+     * receive path.
+     *
+     * <p>
+     * On return {@link #sbuf} holds a synthetic NetBIOS header plus the decrypted SMB2 header, and
+     * {@link #transformPayload} holds the whole decrypted message, so {@code doRecvSMB2} can proceed unchanged.
+     * </p>
+     *
+     * @return the message id of the decrypted message, or null at end of stream
+     */
+    private Long peekTransformedKey() throws IOException {
+        final int size = Encdec.dec_uint16be(this.sbuf, 2) & 0xFFFF | (this.sbuf[1] & 0xFF) << 16;
+        final int minSize = Smb2TransformHeader.TRANSFORM_HEADER_SIZE + Smb2Constants.SMB2_HEADER_LENGTH;
+        final int maximumBufferSize = getContext().getConfig().getMaximumBufferSize();
+        if (size < minSize || size > maximumBufferSize + Smb2TransformHeader.TRANSFORM_HEADER_SIZE) {
+            throw new IOException("Invalid transform message size: " + size);
+        }
+
+        final byte[] wire = new byte[size];
+        // peekKey has already pulled the NetBIOS header plus the first 32 bytes of the transform header.
+        System.arraycopy(this.sbuf, 4, wire, 0, SmbConstants.SMB1_HEADER_LENGTH);
+        final int remaining = size - SmbConstants.SMB1_HEADER_LENGTH;
+        if (readn(this.in, wire, SmbConstants.SMB1_HEADER_LENGTH, remaining) < remaining) {
+            return null;
+        }
+
+        final long sessionId = SMBUtil.readInt8(wire, 44);
+        final SmbSessionImpl session = getSessionById(sessionId);
+        final Smb2EncryptionContext encryptionContext = session != null ? session.getEncryptionContext() : null;
+        if (encryptionContext == null) {
+            // Most likely a late response for a session that has just been logged off. The frame has been read in
+            // full, so it can be dropped on its own; failing the transport here would take down every other
+            // session sharing it. A message that fails to decrypt is treated as fatal below.
+            log.warn("Discarding encrypted message for unknown session 0x" + Long.toHexString(sessionId));
+            return discardTransformedMessage();
+        }
+
+        final byte[] plaintext;
+        try {
+            plaintext = encryptionContext.decryptMessage(wire);
+        } catch (final CIFSException e) {
+            throw new IOException("Failed to decrypt message for session 0x" + Long.toHexString(sessionId), e);
+        }
+
+        if (plaintext.length < Smb2Constants.SMB2_HEADER_LENGTH) {
+            throw new IOException("Decrypted message is shorter than an SMB2 header");
+        }
+        if (plaintext[0] != (byte) 0xFE || plaintext[1] != (byte) 'S' || plaintext[2] != (byte) 'M' || plaintext[3] != (byte) 'B') {
+            throw new IOException("Decrypted message is not an SMB2 message");
+        }
+
+        // MS-SMB2 3.2.5.1.1: the session id in the decrypted header must equal the one in the transform header.
+        // A transport multiplexes sessions and message ids are transport-global, so without this check a message
+        // decrypted under one session's key could be dispatched to a request issued on another.
+        final long innerSessionId = SMBUtil.readInt8(plaintext, 40);
+        if (innerSessionId != sessionId) {
+            throw new IOException("Transform header session id 0x" + Long.toHexString(sessionId)
+                    + " does not match decrypted header session id 0x" + Long.toHexString(innerSessionId));
+        }
+
+        this.smb2 = true;
+        this.transformPayload = plaintext;
+        this.transformPayloadOffset = Smb2Constants.SMB2_HEADER_LENGTH;
+
+        // Present the plaintext exactly as an unencrypted message would have arrived.
+        this.sbuf[0] = 0;
+        this.sbuf[1] = (byte) (plaintext.length >> 16);
+        this.sbuf[2] = (byte) (plaintext.length >> 8);
+        this.sbuf[3] = (byte) plaintext.length;
+        System.arraycopy(plaintext, 0, this.sbuf, 4, Smb2Constants.SMB2_HEADER_LENGTH);
+
+        return (long) Encdec.dec_uint64le(this.sbuf, 28);
+    }
+
+    /**
+     * Reads and decompresses a complete SMB2 COMPRESSION_TRANSFORM_HEADER message, then presents the original
+     * message to the normal receive path, exactly as {@link #peekTransformedKey()} does for an encrypted one.
+     *
+     * <p>
+     * Every failure here throws rather than skipping the frame. MS-SMB2 3.2.5.1.1.2 requires the connection to be
+     * dropped when a compressed message cannot be read, and the reason is the stream rather than the message: a
+     * frame that cannot be decompressed cannot be measured either, so there is no way to find where the next one
+     * begins.
+     * </p>
+     *
+     * @return the message id of the decompressed message, or null at end of stream
+     */
+    private Long peekCompressedKey() throws IOException {
+        final int headerSize = org.codelibs.jcifs.smb.internal.smb2.compress.Smb2CompressionTransformHeader.HEADER_SIZE;
+        final int size = Encdec.dec_uint16be(this.sbuf, 2) & 0xFFFF | (this.sbuf[1] & 0xFF) << 16;
+        final int maximumBufferSize = getContext().getConfig().getMaximumBufferSize();
+        if (size < headerSize + Smb2Constants.SMB2_HEADER_LENGTH || size > maximumBufferSize + headerSize) {
+            throw new IOException("Invalid compressed message size: " + size);
+        }
+
+        final byte[] wire = new byte[size];
+        // peekKey has already pulled the NetBIOS header plus the first 32 bytes of the frame.
+        System.arraycopy(this.sbuf, 4, wire, 0, SmbConstants.SMB1_HEADER_LENGTH);
+        final int remaining = size - SmbConstants.SMB1_HEADER_LENGTH;
+        if (readn(this.in, wire, SmbConstants.SMB1_HEADER_LENGTH, remaining) < remaining) {
+            return null;
+        }
+
+        final byte[] original;
+        try {
+            final org.codelibs.jcifs.smb.internal.smb2.compress.Smb2CompressionTransformHeader header =
+                    org.codelibs.jcifs.smb.internal.smb2.compress.Smb2CompressionTransformHeader.decode(wire, 0, size);
+            if (header.isChained()) {
+                throw new IOException("Server sent a chained compressed message, which this client does not negotiate");
+            }
+            if (!isNegotiatedCompression(header.getAlgorithm())) {
+                throw new IOException("Server compressed with algorithm " + header.getAlgorithm() + ", which was not negotiated");
+            }
+            if (header.getOriginalSize() > maximumBufferSize) {
+                throw new IOException("Compressed message claims to expand to " + header.getOriginalSize() + " bytes");
+            }
+
+            // Everything between the header and Offset travels uncompressed, and the
+            // compressed segment follows it. Handing the declared size to the decompressor
+            // is what makes a misreading of either field an error rather than corruption:
+            // it produces the wrong number of bytes and says so.
+            final int dataStart = headerSize + header.getOffset();
+            final byte[] segment = org.codelibs.jcifs.smb.internal.smb2.compress.PlainLz77.decompress(wire, dataStart, size - dataStart,
+                    header.getOriginalSize());
+            original = new byte[header.getOffset() + segment.length];
+            System.arraycopy(wire, headerSize, original, 0, header.getOffset());
+            System.arraycopy(segment, 0, original, header.getOffset(), segment.length);
+        } catch (final SMBProtocolDecodingException e) {
+            throw new IOException("Failed to decompress message", e);
+        }
+
+        if (original.length < Smb2Constants.SMB2_HEADER_LENGTH) {
+            throw new IOException("Decompressed message is shorter than an SMB2 header");
+        }
+        if (original[0] != (byte) 0xFE || original[1] != (byte) 'S' || original[2] != (byte) 'M' || original[3] != (byte) 'B') {
+            throw new IOException("Decompressed message is not an SMB2 message");
+        }
+
+        this.smb2 = true;
+        this.transformPayload = original;
+        this.transformPayloadOffset = Smb2Constants.SMB2_HEADER_LENGTH;
+
+        // Present it exactly as an uncompressed message would have arrived.
+        this.sbuf[0] = 0;
+        this.sbuf[1] = (byte) (original.length >> 16);
+        this.sbuf[2] = (byte) (original.length >> 8);
+        this.sbuf[3] = (byte) original.length;
+        System.arraycopy(original, 0, this.sbuf, 4, Smb2Constants.SMB2_HEADER_LENGTH);
+
+        return (long) Encdec.dec_uint64le(this.sbuf, 28);
+    }
+
+    /**
+     * Whether an inbound message may be compressed with the given algorithm.
+     *
+     * @param algorithm the algorithm named in the compression transform header
+     * @return true only when that algorithm was agreed during negotiation
+     */
+    private boolean isNegotiatedCompression(final int algorithm) throws SmbException {
+        if (getNegotiateResponse() instanceof final Smb2NegotiateResponse resp) {
+            final int[] negotiated = resp.getCompressionAlgorithms();
+            if (negotiated != null) {
+                for (final int candidate : negotiated) {
+                    if (candidate == algorithm) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Drops a fully-read transform message that could not be routed, without disturbing the stream.
+     *
+     * <p>
+     * Returns a key that cannot match an outstanding request, so the transport loop hands it to {@code doSkip},
+     * which then finds an empty payload and skips nothing.
+     * </p>
+     */
+    private Long discardTransformedMessage() {
+        this.smb2 = true;
+        this.transformPayload = new byte[0];
+        this.transformPayloadOffset = 0;
+        this.sbuf[0] = 0;
+        this.sbuf[1] = 0;
+        this.sbuf[2] = 0;
+        this.sbuf[3] = (byte) Smb2Constants.SMB2_HEADER_LENGTH;
+        Arrays.fill(this.sbuf, 4, 4 + Smb2Constants.SMB2_HEADER_LENGTH, (byte) 0);
+        return Long.MIN_VALUE;
+    }
+
+    /**
+     * Reads message bytes from the decrypted transform payload when one is being dispatched, otherwise from the
+     * socket.
+     */
+    private int readMessageBytes(final byte[] dst, final int off, final int len) throws IOException {
+        if (this.transformPayload == null) {
+            return readn(this.in, dst, off, len);
+        }
+        if (len < 0 || this.transformPayloadOffset + len > this.transformPayload.length) {
+            throw new IOException("Truncated transform payload");
+        }
+        if (off + len > dst.length) {
+            throw new IOException("Transform payload does not fit the receive buffer");
+        }
+        System.arraycopy(this.transformPayload, this.transformPayloadOffset, dst, off, len);
+        this.transformPayloadOffset += len;
+        return len;
+    }
+
+    /**
+     * Skips message bytes in the decrypted transform payload when one is being dispatched, otherwise in the socket.
+     */
+    private void skipMessageBytes(final long count) throws IOException {
+        if (this.transformPayload == null) {
+            this.in.skip(count);
+            return;
+        }
+        this.transformPayloadOffset = (int) Math.min(this.transformPayload.length, this.transformPayloadOffset + count);
+    }
+
+    /**
+     * @return whether the message currently being dispatched arrived inside a transform header
+     */
+    private boolean isDispatchingEncrypted() {
+        return this.transformPayload != null;
+    }
+
     // must be synchronized with peekKey
     @Override
     protected void doRecv(final Response response) throws IOException {
@@ -1354,11 +1463,9 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
             }
             throw e;
         } finally {
-            // a decrypted frame is fully consumed by the message(s) just received
-            this.pendingPlaintext = null;
-            this.pendingPlaintextOffset = 0;
+            this.transformPayload = null;
+            this.transformPayloadOffset = 0;
         }
-
     }
 
     /**
@@ -1391,7 +1498,13 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
 
             // read and decode first
             System.arraycopy(this.sbuf, 4, buffer, 0, Smb2Constants.SMB2_HEADER_LENGTH);
-            readBodyBytes(buffer, Smb2Constants.SMB2_HEADER_LENGTH, rl - Smb2Constants.SMB2_HEADER_LENGTH);
+            readMessageBytes(buffer, Smb2Constants.SMB2_HEADER_LENGTH, rl - Smb2Constants.SMB2_HEADER_LENGTH);
+
+            if (isDispatchingEncrypted()) {
+                // An encrypted message is authenticated by its AEAD tag and is not signed
+                // (MS-SMB2 3.1.4.1); verifying a signature over an unsigned header would fail.
+                cur.setDigest(null);
+            }
 
             cur.setReadSize(rl);
             int len = cur.decode(buffer, 0);
@@ -1408,12 +1521,12 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
                 cur = (ServerMessageBlock2Response) cur.getNextResponse();
                 if (cur == null) {
                     log.warn("Response not properly set up");
-                    skipBodyBytes(size);
+                    skipMessageBytes(size);
                     break;
                 }
 
                 // read next header
-                readBodyBytes(buffer, 0, Smb2Constants.SMB2_HEADER_LENGTH);
+                readMessageBytes(buffer, 0, Smb2Constants.SMB2_HEADER_LENGTH);
                 nextCommand = Encdec.dec_uint32le(buffer, 20);
 
                 if ((nextCommand != 0 ? nextCommand > maximumBufferSize : size > maximumBufferSize)) {
@@ -1428,7 +1541,7 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
                 }
 
                 cur.setReadSize(rl);
-                readBodyBytes(buffer, Smb2Constants.SMB2_HEADER_LENGTH, rl - Smb2Constants.SMB2_HEADER_LENGTH);
+                readMessageBytes(buffer, Smb2Constants.SMB2_HEADER_LENGTH, rl - Smb2Constants.SMB2_HEADER_LENGTH);
 
                 len = cur.decode(buffer, 0, true);
                 if (len > rl) {
@@ -1487,46 +1600,50 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
 
     @Override
     protected void doSkip(final Long key) throws IOException {
-        synchronized (this.inLock) {
-            if (this.pendingPlaintext != null) {
-                // an encrypted frame was already fully read and decrypted;
-                // deliver notifications, otherwise discard the buffered
-                // plaintext - the socket must not be touched, the stream
-                // position is already past this frame
-                try {
-                    final Response notification = createNotification(key);
-                    if (notification != null) {
-                        log.debug("Parsing notification");
-                        doRecv(notification);
-                        handleNotification(notification);
-                        return;
-                    }
-                    log.warn("Skipping encrypted message " + key);
-                } finally {
-                    this.pendingPlaintext = null;
-                    this.pendingPlaintextOffset = 0;
-                }
-                return;
-            }
+        try {
+            doSkip0(key);
+        } finally {
+            this.transformPayload = null;
+            this.transformPayloadOffset = 0;
+        }
+    }
 
+    private void doSkip0(final Long key) throws IOException {
+        synchronized (this.inLock) {
             final int size = Encdec.dec_uint16be(this.sbuf, 2) & 0xFFFF;
             if (size < 33 || 4 + size > this.getContext().getConfig().getReceiveBufferSize()) {
                 /* log message? */
                 log.warn("Flusing stream input");
-                this.in.skip(this.in.available());
+                if (!isDispatchingEncrypted()) {
+                    this.in.skip(this.in.available());
+                }
             } else {
                 final Response notification = createNotification(key);
                 if (notification != null) {
                     log.debug("Parsing notification");
-                    doRecv(notification);
-                    handleNotification(notification);
+                    // Only a message that is not part of a compound chain is read in full before it is decoded. In a
+                    // chain, decoding stops with the rest of the chain still unread, so a failure there has to stay
+                    // fatal - carrying on would read every later message from the wrong offset.
+                    final boolean standalone = !this.isSMB2() || Encdec.dec_uint32le(this.sbuf, 4 + 20) == 0;
+                    try {
+                        doRecv(notification);
+                        handleNotification(notification);
+                    } catch (final SMBProtocolDecodingException | RuntimeException e) {
+                        if (!standalone) {
+                            throw e;
+                        }
+                        // The whole message is read before it is decoded, so the stream is already at the next one
+                        // and only this notification is lost. Nothing is waiting on it, whereas failing here would
+                        // take down the connection along with every request in flight on every session sharing it.
+                        log.warn("Ignoring a notification that could not be handled", e);
+                    }
                     return;
                 }
                 log.warn("Skipping message " + key);
                 if (this.isSMB2()) {
-                    this.in.skip(size - Smb2Constants.SMB2_HEADER_LENGTH);
+                    skipMessageBytes(size - Smb2Constants.SMB2_HEADER_LENGTH);
                 } else {
-                    this.in.skip(size - SmbConstants.SMB1_HEADER_LENGTH);
+                    skipMessageBytes(size - SmbConstants.SMB1_HEADER_LENGTH);
                 }
             }
         }
@@ -1536,7 +1653,119 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
      * @param notification
      */
     protected void handleNotification(final Response notification) {
+        if (notification instanceof final Smb2OplockBreakNotification brk) {
+            handleBreak(brk);
+            return;
+        }
         log.info("Received notification " + notification);
+    }
+
+    /**
+     * Answers an oplock break, MS-SMB2 3.2.5.19.1.
+     *
+     * <p>
+     * A break names nothing but a file id. Its own header is no help - the TreeId is always zero and the SessionId is
+     * zero on several servers - so the open is found in the session open tables and the acknowledgement is sent on
+     * that open's own tree, which is what gives it the right session and tree id. A break naming an open we do not
+     * have is ignored, as the specification requires.
+     * </p>
+     *
+     * @param brk the break notification
+     */
+    private void handleBreak(final Smb2OplockBreakNotification brk) {
+        if (brk.isLeaseBreak()) {
+            // jcifs never asks for a lease, so it holds no lease state to give up.
+            log.info("Ignoring a lease break for a lease that was never requested: " + brk);
+            return;
+        }
+
+        final byte[] fileId = brk.getFileId();
+        final SmbFileHandleImpl open = findOpen(brk.getSessionId(), fileId);
+        if (open == null) {
+            log.debug("Ignoring an oplock break naming an open we do not have: " + brk);
+            return;
+        }
+
+        if (!open.hasOplock()) {
+            // 3.2.5.19.1 stops processing for an open that holds no oplock, and nothing may be recorded from the
+            // notification either: it is not authenticated, so taking a level from it would let a server raise what
+            // this open appears to hold and make the next break answerable. Every ordinary open is in this state,
+            // because jcifs asks for no oplock.
+            log.debug("Ignoring an oplock break for an open that holds no oplock: " + brk);
+            return;
+        }
+
+        final byte newOplockLevel = brk.getOplockLevel();
+        final boolean acknowledge = Smb2OplockBreakAcknowledgment.isRequired(open.getOplockLevel(), newOplockLevel);
+        open.setOplockLevel(newOplockLevel);
+        if (acknowledge) {
+            acknowledgeBreak(open, fileId, newOplockLevel);
+        } else if (log.isDebugEnabled()) {
+            log.debug("Oplock break needs no acknowledgement: " + brk);
+        }
+    }
+
+    /**
+     * Finds the open a break names.
+     *
+     * @param sessionId the session id the notification carried, which is zero on several servers
+     * @param fileId    the file id the notification named
+     * @return the open, or null if no session of this connection has it
+     */
+    private SmbFileHandleImpl findOpen(final long sessionId, final byte[] fileId) {
+        if (sessionId != 0) {
+            final SmbSessionImpl session = getSessionById(sessionId);
+            if (session != null) {
+                // The server named the session, so only its opens are candidates. File ids are unique within a
+                // session, not across them, so searching the others could match an unrelated open.
+                return session.getOpen(fileId);
+            }
+        }
+        for (final SmbSessionImpl session : this.sessionsById.values()) {
+            final SmbFileHandleImpl open = session.getOpen(fileId);
+            if (open != null) {
+                return open;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Sends the acknowledgement, off the receive thread.
+     *
+     * <p>
+     * An acknowledgement draws a reply, and waiting for one here would stop the loop that reads it; it would also
+     * hold up every other session sharing the connection while it waited. The tree is acquired here rather than in
+     * the worker so that the open cannot go away in between.
+     * </p>
+     */
+    private void acknowledgeBreak(final SmbFileHandleImpl open, final byte[] fileId, final byte oplockLevel) {
+        final SmbTreeHandleImpl tree;
+        try {
+            tree = open.getTree();
+        } catch (final RuntimeException e) {
+            log.debug("Open went away before its oplock break could be acknowledged", e);
+            return;
+        }
+
+        final Thread worker = new Thread(() -> {
+            try (SmbTreeHandleImpl th = tree) {
+                th.send(new Smb2OplockBreakAcknowledgment(getContext().getConfig(), fileId, oplockLevel), RequestParam.NO_RETRY);
+            } catch (final Exception e) {
+                // 3.2.5.19.3: an acknowledgement the server refuses leaves the open holding no oplock at all.
+                open.dropOplock();
+                log.warn("Failed to acknowledge an oplock break", e);
+            }
+        }, "jcifs-oplock-break-ack");
+        worker.setDaemon(true);
+        try {
+            worker.start();
+        } catch (final Throwable t) {
+            // The worker releases the tree once it runs. If it never runs - the machine is out of threads - nothing
+            // else would, and the tree connection would be pinned for the life of the connection.
+            tree.release();
+            throw t;
+        }
     }
 
     /**
@@ -1657,6 +1886,8 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
             checkReferral(resp, path, (RequestWithPath) req);
             // checkReferral always throws and exception but put break here for clarity
             break;
+        case NtStatus.NT_STATUS_STOPPED_ON_SYMLINK:
+            throw createSymlinkException(req, resp);
         case NtStatus.NT_STATUS_BUFFER_OVERFLOW:
             if (resp instanceof Smb2ReadResponse) {
                 break;
@@ -1678,6 +1909,29 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
             throw new SMBSignatureValidationException("Signature verification failed.");
         }
         return cont;
+    }
+
+    /**
+     * Builds the exception for a STATUS_STOPPED_ON_SYMLINK response, carrying the link target the
+     * server disclosed. Falls back to a plain {@link SmbException} if that data cannot be decoded,
+     * so a malformed response never turns into something worse than the status itself.
+     *
+     * @param req the request that hit the link
+     * @param resp its response
+     * @return the exception to throw
+     */
+    private static SmbException createSymlinkException(final ServerMessageBlock2 req, final Response resp) {
+        if (resp instanceof ServerMessageBlock2) {
+            final ServerMessageBlock2 r = (ServerMessageBlock2) resp;
+            try {
+                final Smb2SymlinkErrorResponse symlink = Smb2SymlinkErrorResponse.decode(r.getErrorData(), r.getErrorContextCount());
+                final String path = req instanceof RequestWithPath ? ((RequestWithPath) req).getFullUNCPath() : null;
+                return new SmbSymlinkException(path, symlink);
+            } catch (final SMBProtocolDecodingException e) {
+                log.warn("Could not decode the symlink error data, reporting the status alone", e);
+            }
+        }
+        return new SmbException(NtStatus.NT_STATUS_STOPPED_ON_SYMLINK, null);
     }
 
     /**
@@ -1988,10 +2242,10 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
     /**
      * Create encryption context for SMB3 encrypted communication
      *
-     * @param sessionKey the session key from GSS-API authentication, truncated
-     *            to 16 bytes (MS-SMB2 Session.SessionKey)
-     * @param fullSessionKey the untruncated session key (MS-SMB2
-     *            Session.FullSessionKey), required for the AES-256 ciphers
+     * @param sessionKey the session key from GSS-API authentication, truncated to 16 bytes (MS-SMB2
+     *            Session.SessionKey)
+     * @param fullSessionKey the untruncated session key (MS-SMB2 Session.FullSessionKey), required for the AES-256
+     *            ciphers
      * @param preauthHash the pre-authentication integrity hash (SMB 3.1.1 only)
      * @return encryption context
      * @throws CIFSException if encryption is not supported or fails
@@ -2002,12 +2256,6 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
             throw new SmbUnsupportedOperationException("SMB2/SMB3 required for encryption");
         }
 
-        if (sessionKey == null || sessionKey.length == 0) {
-            // e.g. anonymous or guest sessions have no session key - surface a clear
-            // error instead of leaking the KDF's IllegalArgumentException (refs codelibs/jcifs#70)
-            throw new SmbUnsupportedOperationException("Session key is not available for encryption key derivation");
-        }
-
         final Smb2NegotiateResponse resp = (Smb2NegotiateResponse) this.negotiated;
         final DialectVersion dialect = resp.getSelectedDialect();
         int cipherId = -1;
@@ -2015,43 +2263,26 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
         if (dialect.atLeast(DialectVersion.SMB311)) {
             cipherId = resp.getSelectedCipher();
             if (cipherId == -1) {
-                // Default to AES-128-GCM for SMB 3.1.1 if no cipher negotiated
-                cipherId = EncryptionNegotiateContext.CIPHER_AES128_GCM;
+                // MS-SMB2 3.2.5.2: with no encryption capabilities context in the response the cipher is
+                // AES-128-CCM.
+                cipherId = EncryptionNegotiateContext.CIPHER_AES128_CCM;
             }
         } else if (dialect.atLeast(DialectVersion.SMB300)) {
-            // SMB 3.0/3.0.2 only supports AES-128-CCM; honour a configured
-            // narrowing of the allowed ciphers
+            // SMB 3.0/3.0.2 only supports AES-128-CCM
             cipherId = EncryptionNegotiateContext.CIPHER_AES128_CCM;
-            final int[] allowedCiphers = getContext().getConfig().getEncryptionCiphers();
-            if (allowedCiphers != null) {
-                boolean allowed = false;
-                for (final int c : allowedCiphers) {
-                    if (c == cipherId) {
-                        allowed = true;
-                        break;
-                    }
-                }
-                if (!allowed) {
-                    throw new SmbUnsupportedOperationException(
-                            "AES-128-CCM is disabled by configuration but is the only cipher available for " + dialect);
-                }
-            }
         } else {
             throw new SmbUnsupportedOperationException("SMB3 required for encryption, negotiated: " + dialect);
         }
 
-        final int keyLength = Smb2EncryptionContext.getKeyLength(cipherId);
+        final int keyLength = Smb2EncryptionContext.keyLength(cipherId);
 
-        // MS-SMB2 3.1.4.2: the AES-256 ciphers derive their keys from
-        // Session.FullSessionKey with L=256, everything else - signing, the
-        // application key, the AES-128 ciphers - from the 16-byte
-        // Session.SessionKey with L=128. The two are the same array for NTLM,
-        // whose key is always 16 bytes, but a Kerberos AES256 session key is 32
-        // bytes: deriving from the truncated form there produces keys the
-        // server cannot reproduce, and it silently discards everything the
-        // client sends.
+        // MS-SMB2 3.1.4.2: the AES-256 ciphers derive their keys from Session.FullSessionKey, everything else -
+        // signing, the application key, the AES-128 ciphers - from the 16-byte Session.SessionKey. The two are the
+        // same for NTLM, whose key is always 16 bytes, but a Kerberos AES256 session key is 32 bytes: deriving from
+        // the truncated form there produces keys the server cannot reproduce, and it silently discards everything
+        // the client sends.
         final byte[] kdfKey;
-        if (keyLength > 16) {
+        if (keyLength > Smb3KeyDerivation.CIPHER_KEY_LENGTH_128) {
             if (fullSessionKey == null || fullSessionKey.length == 0) {
                 throw new SmbUnsupportedOperationException(
                         "The full session key is required to derive keys for cipher 0x" + Integer.toHexString(cipherId));
@@ -2062,7 +2293,9 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
         }
 
         try {
-            // Derive encryption and decryption keys using SMB3 KDF
+            // Derive encryption and decryption keys using SMB3 KDF, at the length the negotiated cipher requires:
+            // the AES-256 ciphers need 32 bytes. Only the cipher keys vary - the signing key stays 16 bytes
+            // whatever was negotiated, which is why the length is passed here and not inside the derivation.
             final int dialectInt = dialect.getDialect();
             final byte[] encryptionKey = Smb3KeyDerivation.deriveEncryptionKey(dialectInt, kdfKey, preauthHash, keyLength);
             final byte[] decryptionKey = Smb3KeyDerivation.deriveDecryptionKey(dialectInt, kdfKey, preauthHash, keyLength);
@@ -2071,6 +2304,41 @@ class SmbTransportImpl extends Transport implements SmbTransportInternal, SmbCon
         } catch (final Exception e) {
             throw new CIFSException("Failed to create encryption context", e);
         }
+    }
+
+    /**
+     * Registers a session under its server-assigned id so inbound encrypted messages can be routed to its keys.
+     *
+     * @param sessionId
+     *            the server-assigned session id
+     * @param session
+     *            the session
+     */
+    void registerSessionId(final long sessionId, final SmbSessionImpl session) {
+        if (sessionId != 0) {
+            this.sessionsById.put(sessionId, session);
+        }
+    }
+
+    /**
+     * Removes a session from the id index.
+     *
+     * @param sessionId
+     *            the server-assigned session id
+     */
+    void unregisterSessionId(final long sessionId) {
+        if (sessionId != 0) {
+            this.sessionsById.remove(sessionId);
+        }
+    }
+
+    /**
+     * @param sessionId
+     *            the server-assigned session id
+     * @return the session with that id, or null if no such session is established
+     */
+    SmbSessionImpl getSessionById(final long sessionId) {
+        return this.sessionsById.get(sessionId);
     }
 
     public int getRequestSecurityMode(final Smb2NegotiateResponse first) {

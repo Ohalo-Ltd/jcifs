@@ -16,8 +16,7 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 /*
- * Modified by Ohalo Ltd on 2026-08-17: account for the transform-header overhead in the negotiated
- * read and write maxima, and honour encryptionRequired.
+ * Modified by Ohalo Ltd on 2026-10-01: accept encryption when jcifs.client.encryptionRequired is set.
  */
 package org.codelibs.jcifs.smb.internal.smb2.nego;
 
@@ -30,9 +29,9 @@ import org.codelibs.jcifs.smb.internal.CommonServerMessageBlock;
 import org.codelibs.jcifs.smb.internal.SMBProtocolDecodingException;
 import org.codelibs.jcifs.smb.internal.SmbNegotiationRequest;
 import org.codelibs.jcifs.smb.internal.SmbNegotiationResponse;
+import org.codelibs.jcifs.smb.internal.smb2.ServerMessageBlock2Request;
 import org.codelibs.jcifs.smb.internal.smb2.ServerMessageBlock2Response;
 import org.codelibs.jcifs.smb.internal.smb2.Smb2Constants;
-import org.codelibs.jcifs.smb.internal.smb2.Smb2TransformHeader;
 import org.codelibs.jcifs.smb.internal.smb2.io.Smb2ReadResponse;
 import org.codelibs.jcifs.smb.internal.smb2.io.Smb2WriteRequest;
 import org.codelibs.jcifs.smb.internal.util.SMBUtil;
@@ -70,6 +69,13 @@ public class Smb2NegotiateResponse extends ServerMessageBlock2Response implement
     private boolean supportsEncryption;
     private int selectedCipher = -1;
     private int selectedPreauthHash = -1;
+    private int selectedSigningAlgorithm = -1;
+    /**
+     * What the server agreed to compress with, empty when it declined and null when
+     * compression was never asked for. Empty and null are kept apart because only the
+     * first means the question was put and answered.
+     */
+    private int[] compressionAlgorithms;
 
     /**
      * Constructs an SMB2 negotiate response with the given configuration.
@@ -126,12 +132,45 @@ public class Smb2NegotiateResponse extends ServerMessageBlock2Response implement
     }
 
     /**
+     * Gets the compression algorithms the server agreed to.
+     *
+     * @return the agreed algorithms, an empty array if the server declined, or null if
+     *         compression was not negotiated at all
+     */
+    public int[] getCompressionAlgorithms() {
+        return this.compressionAlgorithms;
+    }
+
+    /**
+     * Whether a message on this connection may arrive compressed.
+     *
+     * @return true when at least one compression algorithm was agreed
+     */
+    public boolean isCompressionNegotiated() {
+        return this.compressionAlgorithms != null && this.compressionAlgorithms.length > 0;
+    }
+
+    /**
      * Gets the pre-authentication integrity hash algorithm selected for SMB 3.1.1.
      *
      * @return the selectedPreauthHash
      */
     public int getSelectedPreauthHash() {
         return this.selectedPreauthHash;
+    }
+
+    /**
+     * Gets the signing algorithm selected for SMB 3.1.1.
+     *
+     * <p>
+     * {@code -1} when the server returned no SIGNING_CAPABILITIES context, which a 3.1.1 server is free to do and
+     * which means AES-128-CMAC (MS-SMB2 3.3.5.4) - the algorithm this client used before the context was offered.
+     * </p>
+     *
+     * @return the selectedSigningAlgorithm, or -1 if none was negotiated
+     */
+    public int getSelectedSigningAlgorithm() {
+        return this.selectedSigningAlgorithm;
     }
 
     /**
@@ -297,19 +336,23 @@ public class Smb2NegotiateResponse extends ServerMessageBlock2Response implement
             return false;
         }
 
-        int maxBufferSize = tc.getConfig().getTransactionBufferSize();
-        if (this.supportsEncryption) {
-            // encrypted frames carry a 52-byte transform header (which includes
-            // the auth tag) on top of the message; reserve that overhead so a
-            // maximum-size encrypted frame stays within the cleartext frame
-            // budget everywhere buffers are sized from these maxima
-            maxBufferSize -= Smb2TransformHeader.TRANSFORM_HEADER_SIZE;
+        final int maxBufferSize = tc.getConfig().getTransactionBufferSize();
+        if (haveCapabilitiy(Smb2Constants.SMB2_GLOBAL_CAP_LARGE_MTU)) {
+            // Multi-credit was granted, so one transfer may span several credits worth of payload. This hangs off
+            // the capability rather than off the size the server offered, because a server offers a large size
+            // whether or not it granted multi-credit - Samba offers 8 MiB either way - and without the capability
+            // there are no credits to pay for a transfer that large.
+            final int transferCeiling = tc.getConfig().getMaximumTransferSize();
+            this.maxReadSize = Math.min(transferCeiling, this.maxReadSize) & ~0x7;
+            this.maxWriteSize = Math.min(transferCeiling, this.maxWriteSize) & ~0x7;
+        } else {
+            this.maxReadSize =
+                    Math.min(maxBufferSize - Smb2ReadResponse.OVERHEAD, Math.min(tc.getConfig().getReceiveBufferSize(), this.maxReadSize))
+                            & ~0x7;
+            this.maxWriteSize =
+                    Math.min(maxBufferSize - Smb2WriteRequest.OVERHEAD, Math.min(tc.getConfig().getSendBufferSize(), this.maxWriteSize))
+                            & ~0x7;
         }
-        this.maxReadSize =
-                Math.min(maxBufferSize - Smb2ReadResponse.OVERHEAD, Math.min(tc.getConfig().getReceiveBufferSize(), this.maxReadSize))
-                        & ~0x7;
-        this.maxWriteSize =
-                Math.min(maxBufferSize - Smb2WriteRequest.OVERHEAD, Math.min(tc.getConfig().getSendBufferSize(), this.maxWriteSize)) & ~0x7;
         this.maxTransactSize = Math.min(maxBufferSize - 512, this.maxTransactSize) & ~0x7;
 
         return true;
@@ -321,10 +364,44 @@ public class Smb2NegotiateResponse extends ServerMessageBlock2Response implement
             return false;
         }
 
-        boolean foundPreauth = false, foundEnc = false;
+        boolean foundPreauth = false, foundEnc = false, foundSigning = false, foundCompression = false;
         for (final NegotiateContextResponse ncr : this.negotiateContexts) {
             if (ncr == null) {
                 continue;
+            }
+            if (!foundSigning && ncr.getContextType() == SigningNegotiateContext.NEGO_CTX_SIGNING_TYPE) {
+                foundSigning = true;
+                final SigningNegotiateContext sign = (SigningNegotiateContext) ncr;
+                if (!checkSigningContext(req, sign)) {
+                    return false;
+                }
+                this.selectedSigningAlgorithm = sign.getSigningAlgos()[0];
+                continue;
+            }
+            if (ncr.getContextType() == SigningNegotiateContext.NEGO_CTX_SIGNING_TYPE) {
+                log.error("Multiple signing negotiate contexts");
+                return false;
+            }
+            if (!foundCompression && ncr.getContextType() == CompressionNegotiateContext.NEGO_CTX_COMPRESSION_TYPE) {
+                foundCompression = true;
+                final CompressionNegotiateContext comp = (CompressionNegotiateContext) ncr;
+                final int[] selected = comp.getAlgorithms();
+                if (selected.length == 1 && selected[0] == CompressionNegotiateContext.COMPRESSION_NONE) {
+                    // MS-SMB2 3.2.5.2: NONE on its own is the server declining, which is not
+                    // an error. Recording it as an empty list rather than failing is what
+                    // keeps a connection to such a server working exactly as it did before.
+                    this.compressionAlgorithms = new int[0];
+                    continue;
+                }
+                if (!checkCompressionContext(req, comp)) {
+                    return false;
+                }
+                this.compressionAlgorithms = selected;
+                continue;
+            }
+            if (ncr.getContextType() == CompressionNegotiateContext.NEGO_CTX_COMPRESSION_TYPE) {
+                log.error("Multiple compression negotiate contexts");
+                return false;
             }
             if (!foundEnc && ncr.getContextType() == EncryptionNegotiateContext.NEGO_CTX_ENC_TYPE) {
                 foundEnc = true;
@@ -393,6 +470,44 @@ public class Smb2NegotiateResponse extends ServerMessageBlock2Response implement
         return true;
     }
 
+    /**
+     * Validates a SIGNING_CAPABILITIES context in the response.
+     *
+     * <p>
+     * An absent context is not an error - a 3.1.1 server may ignore it, and AES-128-CMAC then applies - but a
+     * context naming an algorithm the client did not offer is, for the same reason the cipher selection is checked
+     * against the request: otherwise a server could steer the client onto an algorithm it deliberately excluded.
+     * </p>
+     */
+    private static boolean checkSigningContext(final Smb2NegotiateRequest req, final SigningNegotiateContext sc) {
+        if (sc.getSigningAlgos() == null || sc.getSigningAlgos().length != 1) {
+            log.error("Server returned no signing algorithm selection");
+            return false;
+        }
+
+        SigningNegotiateContext rsc = null;
+        for (final NegotiateContextRequest rnc : req.getNegotiateContexts()) {
+            if (rnc instanceof SigningNegotiateContext) {
+                rsc = (SigningNegotiateContext) rnc;
+            }
+        }
+        if (rsc == null) {
+            return false;
+        }
+
+        boolean valid = false;
+        for (final int algo : rsc.getSigningAlgos()) {
+            if (algo == sc.getSigningAlgos()[0]) {
+                valid = true;
+            }
+        }
+        if (!valid) {
+            log.error("Server returned invalid signing algorithm selection");
+            return false;
+        }
+        return true;
+    }
+
     private static boolean checkEncryptionContext(final Smb2NegotiateRequest req, final EncryptionNegotiateContext ec) {
         if (ec.getCiphers() == null || ec.getCiphers().length != 1) {
             log.error("Server returned no cipher selection");
@@ -418,6 +533,41 @@ public class Smb2NegotiateResponse extends ServerMessageBlock2Response implement
         if (!valid) {
             log.error("Server returned invalid cipher selection");
             return false;
+        }
+        return true;
+    }
+
+    private static boolean checkCompressionContext(final Smb2NegotiateRequest req, final CompressionNegotiateContext cc) {
+        if (cc.getAlgorithms() == null || cc.getAlgorithms().length == 0) {
+            log.error("Server returned no compression selection");
+            return false;
+        }
+
+        CompressionNegotiateContext offered = null;
+        for (final NegotiateContextRequest rnc : req.getNegotiateContexts()) {
+            if (rnc instanceof CompressionNegotiateContext) {
+                offered = (CompressionNegotiateContext) rnc;
+            }
+        }
+        if (offered == null) {
+            log.error("Server returned a compression selection that was never asked for");
+            return false;
+        }
+
+        // MS-SMB2 3.2.5.2: every algorithm named has to be one that was offered. The
+        // offer says what this client can decompress, so agreeing to anything else
+        // would be promising to read something it cannot.
+        for (final int selected : cc.getAlgorithms()) {
+            boolean offeredIt = false;
+            for (final int algorithm : offered.getAlgorithms()) {
+                if (algorithm == selected) {
+                    offeredIt = true;
+                }
+            }
+            if (!offeredIt) {
+                log.error("Server selected compression algorithm " + selected + ", which was not offered");
+                return false;
+            }
         }
         return true;
     }
@@ -479,6 +629,13 @@ public class Smb2NegotiateResponse extends ServerMessageBlock2Response implement
      */
     @Override
     public void setupRequest(final CommonServerMessageBlock request) {
+        if (!(request instanceof final ServerMessageBlock2Request<?> smb2Request)
+                || !haveCapabilitiy(Smb2Constants.SMB2_GLOBAL_CAP_LARGE_MTU)) {
+            // CreditCharge is reserved before SMB 2.1, and a server that did not grant multi-credit rejects a
+            // request that charges for more than one credit. It stays zero unless both ends agreed on it.
+            return;
+        }
+        smb2Request.setCreditCharge(smb2Request.getCreditCost());
     }
 
     /**
@@ -581,10 +738,14 @@ public class Smb2NegotiateResponse extends ServerMessageBlock2Response implement
      */
     protected static NegotiateContextResponse createContext(final int type) {
         switch (type) {
+        case CompressionNegotiateContext.NEGO_CTX_COMPRESSION_TYPE:
+            return new CompressionNegotiateContext();
         case EncryptionNegotiateContext.NEGO_CTX_ENC_TYPE:
             return new EncryptionNegotiateContext();
         case PreauthIntegrityNegotiateContext.NEGO_CTX_PREAUTH_TYPE:
             return new PreauthIntegrityNegotiateContext();
+        case SigningNegotiateContext.NEGO_CTX_SIGNING_TYPE:
+            return new SigningNegotiateContext();
         }
         return null;
     }

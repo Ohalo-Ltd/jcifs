@@ -1,8 +1,3 @@
-/*
- * Modified by Ohalo Ltd on 2026-08-17: cover the transform-header overhead in the negotiated
- * maxima.
- */
-
 package org.codelibs.jcifs.smb.internal.smb2.nego;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -683,6 +678,78 @@ class Smb2NegotiateResponseTest {
     }
 
     @Test
+    @DisplayName("a signing context in the response is parsed rather than skipped")
+    void testSigningContextIsCreated() {
+        // Without a case for 0x0008 here, createContext returns null, the decode loop leaves the slot null and
+        // checkNegotiateContexts skips it - so the client would offer algorithms and never learn which one the
+        // server chose. The negotiation would be one-way and silently so.
+        NegotiateContextResponse ctx = Smb2NegotiateResponse.createContext(SigningNegotiateContext.NEGO_CTX_SIGNING_TYPE);
+
+        assertNotNull(ctx, "a SIGNING_CAPABILITIES context must be recognised");
+        assertTrue(ctx instanceof SigningNegotiateContext);
+        assertEquals(SigningNegotiateContext.NEGO_CTX_SIGNING_TYPE, ctx.getContextType());
+    }
+
+    @Test
+    @DisplayName("the server's chosen signing algorithm is recorded")
+    void testSelectedSigningAlgorithmIsRecorded() throws Exception {
+        setResponseAsReceived(response);
+        setPrivateField(response, "dialectRevision", 0x0311);
+        setPrivateField(response, "capabilities", 0);
+
+        when(mockRequest.getCapabilities()).thenReturn(0);
+        when(mockRequest.getNegotiateContexts())
+                .thenReturn(new NegotiateContextRequest[] { createMockPreauthContext(), createMockSigningContext() });
+
+        NegotiateContextResponse[] contexts = new NegotiateContextResponse[] { createValidPreauthResponse(),
+                createValidSigningResponse(SigningNegotiateContext.SIGNING_ALGO_AES128_GMAC) };
+        setPrivateField(response, "negotiateContexts", contexts);
+
+        assertTrue(response.isValid(mockContext, mockRequest), "a response selecting an offered algorithm is valid");
+        assertEquals(SigningNegotiateContext.SIGNING_ALGO_AES128_GMAC, response.getSelectedSigningAlgorithm(),
+                "the algorithm the server chose must be recorded, so signing can use it");
+    }
+
+    @Test
+    @DisplayName("a signing algorithm the client never offered is refused")
+    void testUnofferedSigningAlgorithmIsRefused() throws Exception {
+        setResponseAsReceived(response);
+        setPrivateField(response, "dialectRevision", 0x0311);
+        setPrivateField(response, "capabilities", 0);
+
+        when(mockRequest.getCapabilities()).thenReturn(0);
+        // The client offered CMAC and GMAC only.
+        when(mockRequest.getNegotiateContexts())
+                .thenReturn(new NegotiateContextRequest[] { createMockPreauthContext(), createMockSigningContext() });
+
+        // The server answers with HMAC-SHA256, which was not offered. Accepting that would let a server steer the
+        // client onto an algorithm it deliberately did not ask for - the same reason the cipher selection is
+        // validated against the request rather than taken on trust.
+        NegotiateContextResponse[] contexts = new NegotiateContextResponse[] { createValidPreauthResponse(),
+                createValidSigningResponse(SigningNegotiateContext.SIGNING_ALGO_HMAC_SHA256) };
+        setPrivateField(response, "negotiateContexts", contexts);
+
+        assertFalse(response.isValid(mockContext, mockRequest), "an algorithm outside the offered set must fail validation");
+    }
+
+    @Test
+    @DisplayName("a response with no signing context leaves the algorithm unset")
+    void testAbsentSigningContextLeavesAlgorithmUnset() throws Exception {
+        // A 3.1.1 server that ignores the context signs with AES-128-CMAC (MS-SMB2 3.3.5.4), which is what the
+        // client did before this existed. The unset marker is what lets the digest fall back to it.
+        setResponseAsReceived(response);
+        setPrivateField(response, "dialectRevision", 0x0311);
+        setPrivateField(response, "capabilities", 0);
+
+        when(mockRequest.getCapabilities()).thenReturn(0);
+        when(mockRequest.getNegotiateContexts()).thenReturn(new NegotiateContextRequest[] { createMockPreauthContext() });
+        setPrivateField(response, "negotiateContexts", new NegotiateContextResponse[] { createValidPreauthResponse() });
+
+        assertTrue(response.isValid(mockContext, mockRequest), "a response without a signing context is still valid");
+        assertEquals(-1, response.getSelectedSigningAlgorithm(), "no signing context means no negotiated algorithm");
+    }
+
+    @Test
     @DisplayName("Should fail validation with missing negotiate contexts for SMB 3.1.1")
     void testMissingNegotiateContexts() throws Exception {
         // Given
@@ -789,33 +856,56 @@ class Smb2NegotiateResponseTest {
     }
 
     @Test
-    @DisplayName("Should reserve transform-header room in buffer sizes when encryption is negotiated")
-    void testBufferSizeCalculationsWithEncryption() throws Exception {
-        // Given
+    @DisplayName("Should take the transfer ceiling once multi-credit is negotiated")
+    void testTransferCeilingGovernsWhenLargeMtuNegotiated() throws Exception {
+        // Given a server offering 8 MiB - which Samba does - and both ends having agreed on multi-credit
         setResponseAsReceived(response);
         setPrivateField(response, "dialectRevision", 0x0300);
-        setPrivateField(response, "capabilities", Smb2Constants.SMB2_GLOBAL_CAP_ENCRYPTION);
-        setPrivateField(response, "maxReadSize", 1048576);
-        setPrivateField(response, "maxWriteSize", 1048576);
-        setPrivateField(response, "maxTransactSize", 1048576);
+        setPrivateField(response, "maxReadSize", 8388608);
+        setPrivateField(response, "maxWriteSize", 8388608);
+        setPrivateField(response, "maxTransactSize", 8388608);
+        setPrivateField(response, "capabilities", Smb2Constants.SMB2_GLOBAL_CAP_LARGE_MTU);
 
-        when(mockConfig.getTransactionBufferSize()).thenReturn(65536);
-        when(mockConfig.getReceiveBufferSize()).thenReturn(1048576);
-        when(mockConfig.getSendBufferSize()).thenReturn(1048576);
-        when(mockRequest.getCapabilities()).thenReturn(Smb2Constants.SMB2_GLOBAL_CAP_ENCRYPTION);
+        when(mockConfig.getTransactionBufferSize()).thenReturn(65023);
+        when(mockConfig.getReceiveBufferSize()).thenReturn(65535);
+        when(mockConfig.getSendBufferSize()).thenReturn(65535);
+        when(mockConfig.getMaximumTransferSize()).thenReturn(1048576);
+        when(mockRequest.getCapabilities()).thenReturn(Smb2Constants.SMB2_GLOBAL_CAP_LARGE_MTU);
 
         // When
-        boolean valid = response.isValid(mockContext, mockRequest);
+        final boolean valid = response.isValid(mockContext, mockRequest);
 
-        // Then - the maxima leave room for the 52-byte transform header, so an
-        // encrypted frame of a maximum-size message never exceeds the budget a
-        // cleartext frame would have used
+        // Then the SMB1 buffer sizes no longer hold the transfer down
         assertTrue(valid);
-        assertTrue(response.isEncryptionSupported());
-        int budget = 65536 - 52;
-        assertEquals(budget - org.codelibs.jcifs.smb.internal.smb2.io.Smb2ReadResponse.OVERHEAD & ~0x7, response.getReceiveBufferSize());
-        assertEquals(budget - org.codelibs.jcifs.smb.internal.smb2.io.Smb2WriteRequest.OVERHEAD & ~0x7, response.getSendBufferSize());
-        assertEquals(budget - 512 & ~0x7, response.getTransactionBufferSize());
+        assertEquals(1048576, response.getReceiveBufferSize(), "the read size is the transfer ceiling, not rcv_buf_size");
+        assertEquals(1048576, response.getSendBufferSize(), "the write size is the transfer ceiling, not snd_buf_size");
+    }
+
+    @Test
+    @DisplayName("Should stay at 64 KiB when multi-credit was not negotiated")
+    void testTransferStaysAt64KiBWithoutLargeMtu() throws Exception {
+        // Samba offers 8 MiB whether or not the client asked for multi-credit, so the offer alone must not be
+        // enough to raise the transfer size - without the capability there are no credits to pay for it.
+        setResponseAsReceived(response);
+        setPrivateField(response, "dialectRevision", 0x0202);
+        setPrivateField(response, "maxReadSize", 8388608);
+        setPrivateField(response, "maxWriteSize", 8388608);
+        setPrivateField(response, "maxTransactSize", 8388608);
+        setPrivateField(response, "capabilities", 0);
+
+        when(mockConfig.getTransactionBufferSize()).thenReturn(65023);
+        when(mockConfig.getReceiveBufferSize()).thenReturn(65535);
+        when(mockConfig.getSendBufferSize()).thenReturn(65535);
+        when(mockConfig.getMaximumTransferSize()).thenReturn(1048576);
+        when(mockRequest.getCapabilities()).thenReturn(0);
+
+        // When
+        final boolean valid = response.isValid(mockContext, mockRequest);
+
+        // Then
+        assertTrue(valid);
+        assertEquals(64936, response.getReceiveBufferSize(), "without multi-credit the read size is what it always was");
+        assertEquals(64904, response.getSendBufferSize(), "without multi-credit the write size is what it always was");
     }
 
     @ParameterizedTest
@@ -1031,6 +1121,27 @@ class Smb2NegotiateResponseTest {
         EncryptionNegotiateContext ctx = new EncryptionNegotiateContext();
         try {
             setPrivateField(ctx, "ciphers", new int[] { EncryptionNegotiateContext.CIPHER_AES128_GCM });
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+        return ctx;
+    }
+
+    private NegotiateContextRequest createMockSigningContext() {
+        SigningNegotiateContext ctx = new SigningNegotiateContext();
+        try {
+            setPrivateField(ctx, "signingAlgos",
+                    new int[] { SigningNegotiateContext.SIGNING_ALGO_AES128_CMAC, SigningNegotiateContext.SIGNING_ALGO_AES128_GMAC });
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+        return ctx;
+    }
+
+    private SigningNegotiateContext createValidSigningResponse(final int algo) {
+        SigningNegotiateContext ctx = new SigningNegotiateContext();
+        try {
+            setPrivateField(ctx, "signingAlgos", new int[] { algo });
         } catch (Exception e) {
             throw new RuntimeException(e);
         }

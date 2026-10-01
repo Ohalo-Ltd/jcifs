@@ -15,10 +15,6 @@
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
-/*
- * Modified by Ohalo Ltd on 2026-08-17: identify the commands that must not be encrypted, NEGOTIATE
- * and SESSION_SETUP.
- */
 package org.codelibs.jcifs.smb.internal.smb2;
 
 import org.codelibs.jcifs.smb.Configuration;
@@ -124,6 +120,7 @@ public abstract class ServerMessageBlock2 implements CommonServerMessageBlock {
 
     private final byte[] signature = new byte[16];
     private Smb2SigningDigest digest = null;
+    private boolean encrypt;
 
     private final Configuration config;
 
@@ -178,6 +175,10 @@ public abstract class ServerMessageBlock2 implements CommonServerMessageBlock {
         this.digest = null;
         this.sessionId = 0;
         this.treeId = 0;
+        // A retried or DFS-redirected request is re-marked by whichever session/tree it is sent on. Carrying the
+        // previous decision to a different server would encrypt where nothing asked for it, or fail for want of
+        // an encryption context.
+        this.encrypt = false;
     }
 
     /**
@@ -294,6 +295,22 @@ public abstract class ServerMessageBlock2 implements CommonServerMessageBlock {
         return this.creditCharge;
     }
 
+    /**
+     * Sets the credit charge for this message.
+     *
+     * <p>
+     * A message whose payload exceeds 64 KiB has to pay for every 64 KiB it spans (MS-SMB2 3.2.4.1.2), and the server
+     * matches that against the credits it granted. It stays zero on a connection that did not negotiate
+     * {@code SMB2_GLOBAL_CAP_LARGE_MTU}, where the field is reserved.
+     * </p>
+     *
+     * @param creditCharge
+     *            the creditCharge to set
+     */
+    public final void setCreditCharge(final int creditCharge) {
+        this.creditCharge = creditCharge;
+    }
+
     @Override
     public void retainPayload() {
         this.retainPayload = true;
@@ -325,6 +342,33 @@ public abstract class ServerMessageBlock2 implements CommonServerMessageBlock {
     }
 
     /**
+     * Whether this message must be sent inside an SMB2 TRANSFORM_HEADER.
+     *
+     * @return true if the message must be encrypted
+     */
+    public boolean isEncrypt() {
+        return this.encrypt;
+    }
+
+    /**
+     * Marks this message, and every message already chained to it, as requiring SMB3 encryption.
+     *
+     * <p>
+     * A compound chain is wrapped in a single transform header, so the marker must be visible from the head of the
+     * chain no matter which link set it.
+     * </p>
+     *
+     * @param encrypt
+     *            whether the message must be encrypted
+     */
+    public void setEncrypt(final boolean encrypt) {
+        this.encrypt = encrypt;
+        if (this.next != null) {
+            this.next.setEncrypt(encrypt);
+        }
+    }
+
+    /**
      *
      * {@inheritDoc}
      *
@@ -336,20 +380,6 @@ public abstract class ServerMessageBlock2 implements CommonServerMessageBlock {
         if (this.next != null) {
             this.next.setDigest(digest);
         }
-    }
-
-    /**
-     * Checks whether this message must always be sent in cleartext.
-     *
-     * NEGOTIATE and SESSION_SETUP are exempt from transform-header encryption
-     * per MS-SMB2 3.2.4.1.8 - encrypting them is a protocol error. For a
-     * compound chain the head's command decides, as the chain is framed (and
-     * thus encrypted) as a single message.
-     *
-     * @return whether this command is exempt from encryption
-     */
-    public final boolean isEncryptionExempt() {
-        return this.command == SMB2_NEGOTIATE || this.command == SMB2_SESSION_SETUP;
     }
 
     /**
@@ -458,6 +488,9 @@ public abstract class ServerMessageBlock2 implements CommonServerMessageBlock {
         }
 
         n.addFlags(SMB2_FLAGS_RELATED_OPERATIONS);
+        if (this.encrypt) {
+            n.setEncrypt(true);
+        }
         this.next = n;
         return true;
     }
@@ -727,7 +760,11 @@ public abstract class ServerMessageBlock2 implements CommonServerMessageBlock {
         SMBUtil.writeInt4(this.nextCommand, dst, dstIndex + 20);
         SMBUtil.writeInt8(this.mid, dst, dstIndex + 24);
 
-        if (this.async) {
+        // MS-SMB2 2.2.1.2: these eight bytes are the AsyncId when SMB2_FLAGS_ASYNC_COMMAND is set, and reserved plus
+        // the TreeId when it is not, so the flag decides the layout - as it already does when one is read back. The
+        // async field is only ever set while decoding a received message, so keying on it here meant a message we
+        // sent with the flag set still carried a tree id where the peer reads the async id.
+        if ((this.flags & SMB2_FLAGS_ASYNC_COMMAND) == SMB2_FLAGS_ASYNC_COMMAND) {
             SMBUtil.writeInt8(this.asyncId, dst, dstIndex + 32);
         } else {
             // 4 reserved

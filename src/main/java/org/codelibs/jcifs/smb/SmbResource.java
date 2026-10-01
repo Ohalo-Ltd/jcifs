@@ -82,6 +82,15 @@ public interface SmbResource extends AutoCloseable {
      * this <code>SmbResource</code> is a traditional file or directory, it will
      * be queried for on the specified server as expected.
      *
+     * <p>
+     * For a share root this reflects whether the tree connect succeeded, which is
+     * all the protocol offers at that level, and servers answer it differently:
+     * Windows accepts the tree connect for an account the share's ACL excludes and
+     * refuses at open, while Samba refuses the tree connect itself. A
+     * <code>true</code> here therefore says the share is present, not that it can
+     * be read.
+     * </p>
+     *
      * @return <code>true</code> if the resource exists or is alive or
      *         <code>false</code> otherwise
      * @throws CIFSException if an error occurs accessing the resource
@@ -143,24 +152,45 @@ public interface SmbResource extends AutoCloseable {
     boolean isDirectory() throws CIFSException;
 
     /**
-     * Tests to see if the file this <code>SmbResource</code> represents
-     * exists and is not marked read-only. By default, resources are
-     * considered to be read-only and therefore for <code>smb://</code>,
-     * <code>smb://workgroup/</code>, and <code>smb://server/</code> resources
-     * will be read-only.
+     * Tests to see if the file this <code>SmbResource</code> represents can be
+     * written.
      *
-     * @return <code>true</code> if the resource exists is not marked
-     *         read-only
+     * <p>
+     * The resource has to exist and not be marked read-only. On SMB2 the server
+     * is also asked what access it grants this caller, on the same open that
+     * reads the attributes, and a file it will not let the caller write reports
+     * <code>false</code> even when no read-only attribute is set: a permission
+     * that denies writing does not show up in the attributes at all. Where the
+     * server reports no such access - SMB1, or a server that declines to work it
+     * out - only the attribute is consulted, as before.
+     * </p>
+     *
+     * <p>
+     * By default, resources are considered to be read-only and therefore for
+     * <code>smb://</code>, <code>smb://workgroup/</code>, and
+     * <code>smb://server/</code> resources will be read-only.
+     * </p>
+     *
+     * @return <code>true</code> if the resource exists, is not marked read-only,
+     *         and is not one the server says this caller may not write
      * @throws CIFSException if an error occurs accessing the resource
      */
     boolean canWrite() throws CIFSException;
 
     /**
      * Tests to see if the file this <code>SmbResource</code> represents can be
-     * read. Because any file, directory, or other resource can be read if it
-     * exists, this method simply calls the <code>exists</code> method.
+     * read.
      *
-     * @return <code>true</code> if the file is read-only
+     * <p>
+     * On SMB2 the server is asked what access it grants this caller, on the same
+     * open that reads the attributes, and a file whose contents it will not hand
+     * over reports <code>false</code>. Where the server reports no such access -
+     * SMB1, or a server that declines to work it out - this falls back to whether
+     * the resource exists, which is all this method used to answer.
+     * </p>
+     *
+     * @return <code>true</code> if the resource exists and the server does not
+     *         say this caller may not read it
      * @throws CIFSException if an error occurs accessing the resource
      */
     boolean canRead() throws CIFSException;
@@ -643,6 +673,12 @@ public interface SmbResource extends AutoCloseable {
     /**
      * Fetch all children
      *
+     * <p>
+     * A listing is fetched a page at a time. If a page cannot be fetched, the returned iterator hands out the entries
+     * it has already read and then throws {@link RuntimeCIFSException} from {@link java.util.Iterator#next()}, rather
+     * than ending as though the directory held only those entries.
+     * </p>
+     *
      * @return an iterator over the child resources
      * @throws CIFSException if an error occurs accessing the resource
      */
@@ -660,6 +696,9 @@ public interface SmbResource extends AutoCloseable {
      * it will match that many characters <i>or less</i>.
      * <p>
      * Wildcard expressions will not filter workgroup names or server names.
+     * <p>
+     * As with {@link #children()}, the returned iterator throws {@link RuntimeCIFSException} from
+     * {@link java.util.Iterator#next()} if the listing cannot be read to its end.
      *
      * @param wildcard the wildcard pattern to match
      * @return an iterator over the child resources
@@ -669,6 +708,11 @@ public interface SmbResource extends AutoCloseable {
 
     /**
      * Fetch children matching the given filter.
+     *
+     * <p>
+     * As with {@link #children()}, the returned iterator throws {@link RuntimeCIFSException} from
+     * {@link java.util.Iterator#next()} if the listing cannot be read to its end.
+     * </p>
      *
      * @param filter
      *            filter acting on file names
@@ -681,6 +725,11 @@ public interface SmbResource extends AutoCloseable {
 
     /**
      * Fetch children matching the given filter.
+     *
+     * <p>
+     * As with {@link #children()}, the returned iterator throws {@link RuntimeCIFSException} from
+     * {@link java.util.Iterator#next()} if the listing cannot be read to its end.
+     * </p>
      *
      * @param filter
      *            filter acting on SmbResource instances

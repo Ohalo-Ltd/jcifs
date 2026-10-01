@@ -15,9 +15,6 @@
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
-/*
- * Modified by Ohalo Ltd on 2026-08-17: add the AES-256-CCM and AES-256-GCM cipher identifiers.
- */
 package org.codelibs.jcifs.smb.internal.smb2.nego;
 
 import org.codelibs.jcifs.smb.Configuration;
@@ -50,12 +47,12 @@ public class EncryptionNegotiateContext implements NegotiateContextRequest, Nego
     public static final int CIPHER_AES128_GCM = 0x2;
 
     /**
-     * AES 256 CCM
+     * AES 256 CCM (SMB 3.1.1 only)
      */
     public static final int CIPHER_AES256_CCM = 0x3;
 
     /**
-     * AES 256 GCM
+     * AES 256 GCM (SMB 3.1.1 only)
      */
     public static final int CIPHER_AES256_GCM = 0x4;
 

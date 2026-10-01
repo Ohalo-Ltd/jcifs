@@ -164,7 +164,9 @@ class BaseConfigurationTest {
     @DisplayName("Test buffer configuration getters")
     void testBufferConfigurationGetters() {
         assertEquals(0xFFFF - 512, config.getTransactionBufferSize());
-        assertEquals(0x10000, config.getMaximumBufferSize());
+        // Raised from 0x10000 so that a whole message still fits once a single read or write may carry a mebibyte:
+        // a write of that size encodes to 1048576 + 112 bytes.
+        assertEquals(0x101000, config.getMaximumBufferSize());
         assertEquals(16, config.getBufferCacheSize());
         assertEquals(200, config.getListCount());
         assertEquals(65435, config.getListSize());
@@ -394,6 +396,12 @@ class BaseConfigurationTest {
         assertNotNull(testConfig.disallowCompound);
         assertTrue(testConfig.disallowCompound.contains("Smb2SessionSetupRequest"));
         assertTrue(testConfig.disallowCompound.contains("Smb2TreeConnectRequest"));
+
+        // Check encryption ciphers. Only PropertyConfiguration reads the property, so without a default here any
+        // other configuration would hand a null array to the negotiate context the first time encryption is
+        // enabled. AES-128-GCM leads, which keeps the cipher an existing deployment negotiates unchanged.
+        assertArrayEquals(new int[] { 0x2, 0x1, 0x4, 0x3 }, testConfig.getEncryptionCiphers(),
+                "initDefaults must offer AES-128-GCM, AES-128-CCM, AES-256-GCM, AES-256-CCM");
     }
 
     @Test

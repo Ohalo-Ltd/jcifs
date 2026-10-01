@@ -16,8 +16,7 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 /*
- * Modified by Ohalo Ltd on 2026-08-17: offer the configured encryption ciphers, and advertise
- * encryption support when encryption is required.
+ * Modified by Ohalo Ltd on 2026-10-01: advertise encryption when jcifs.client.encryptionRequired is set.
  */
 package org.codelibs.jcifs.smb.internal.smb2.nego;
 
@@ -64,6 +63,13 @@ public class Smb2NegotiateRequest extends ServerMessageBlock2Request<Smb2Negotia
             this.capabilities |= Smb2Constants.SMB2_GLOBAL_CAP_DFS;
         }
 
+        // Multi-credit - and with it the read and write sizes above 64 KiB that a server offers - arrived in SMB 2.1.
+        // A server only grants it to a client that asked (MS-SMB2 3.3.5.4), so without this the transfer sizes stay
+        // at 64 KiB however much the server was willing to give.
+        if (config.getMaximumVersion() != null && config.getMaximumVersion().atLeast(DialectVersion.SMB210)) {
+            this.capabilities |= Smb2Constants.SMB2_GLOBAL_CAP_LARGE_MTU;
+        }
+
         if ((config.isEncryptionEnabled() || config.isEncryptionRequired()) && config.getMaximumVersion() != null
                 && config.getMaximumVersion().atLeast(DialectVersion.SMB300)) {
             this.capabilities |= Smb2Constants.SMB2_GLOBAL_CAP_ENCRYPTION;
@@ -92,14 +98,24 @@ public class Smb2NegotiateRequest extends ServerMessageBlock2Request<Smb2Negotia
             this.preauthSalt = salt;
 
             if (config.isEncryptionEnabled() || config.isEncryptionRequired()) {
-                int[] ciphers = config.getEncryptionCiphers();
-                if (ciphers == null || ciphers.length == 0) {
-                    // MS-SMB2 2.2.3.1.2 preference order
-                    ciphers = new int[] { EncryptionNegotiateContext.CIPHER_AES256_GCM, EncryptionNegotiateContext.CIPHER_AES128_GCM,
-                            EncryptionNegotiateContext.CIPHER_AES256_CCM, EncryptionNegotiateContext.CIPHER_AES128_CCM };
-                }
-                negoContexts.add(new EncryptionNegotiateContext(config, ciphers));
+                // The array order is the client's preference order on the wire, so it is taken from configuration
+                // rather than fixed here. A server picks one of these and may apply its own preference when doing
+                // so, which is why offering AES-256 first does not by itself mean AES-256 is negotiated.
+                negoContexts.add(new EncryptionNegotiateContext(config, config.getEncryptionCiphers()));
             }
+
+            if (config.isCompressionEnabled()) {
+                // Only what this client can actually decompress is offered, and that is not
+                // configurable. MS-SMB2 3.2.5.2 requires the connection to fail if the server
+                // names an algorithm that was not offered, so offering one we cannot read would
+                // turn a working connection into a broken one.
+                negoContexts.add(new CompressionNegotiateContext(config, new int[] { CompressionNegotiateContext.COMPRESSION_LZ77 }));
+            }
+
+            // Unconditionally, unlike the encryption context: signing is negotiated whether or not encryption is
+            // in use, and a signed but unencrypted session is the ordinary case. Without this context a 3.1.1
+            // server signs with AES-128-CMAC (MS-SMB2 3.3.5.4), which is what the client did before.
+            negoContexts.add(new SigningNegotiateContext(config, config.getSigningAlgorithms()));
         }
 
         this.negotiateContexts = negoContexts.toArray(new NegotiateContextRequest[negoContexts.size()]);

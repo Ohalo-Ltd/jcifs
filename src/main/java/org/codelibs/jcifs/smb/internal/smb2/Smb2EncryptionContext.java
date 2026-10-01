@@ -16,8 +16,8 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 /*
- * Modified by Ohalo Ltd on 2026-08-17: use the spec nonce lengths for AES-CCM and AES-GCM, route
- * AEAD through the configured crypto provider, and support the AES-256 ciphers.
+ * Modified by Ohalo Ltd on 2026-10-01: obtain the AES-CCM/AES-GCM ciphers through JCE from the configured
+ * crypto provider instead of the BouncyCastle lightweight API.
  */
 package org.codelibs.jcifs.smb.internal.smb2;
 
@@ -51,6 +51,12 @@ public class Smb2EncryptionContext {
     private final byte[] decryptionKey;
     private final AtomicLong nonceCounter = new AtomicLong(0);
     private final SecureRandom secureRandom = new SecureRandom();
+
+    /**
+     * Random prefix that separates this context's nonce space from any other context that might share a key. The
+     * trailing counter guarantees uniqueness within this context.
+     */
+    private final byte[] noncePrefix;
 
     /**
      * AES-128-CCM cipher identifier for SMB3 encryption
@@ -91,6 +97,39 @@ public class Smb2EncryptionContext {
         this.dialect = dialect;
         this.encryptionKey = encryptionKey.clone();
         this.decryptionKey = decryptionKey.clone();
+        checkKeyLength("encryption", this.encryptionKey);
+        checkKeyLength("decryption", this.decryptionKey);
+        this.noncePrefix = new byte[Math.max(0, getNonceLength() - Long.BYTES)];
+        this.secureRandom.nextBytes(this.noncePrefix);
+    }
+
+    /**
+     * Key length in bytes required by a cipher.
+     *
+     * @param cipherId
+     *            the negotiated cipher identifier
+     * @return the required key length in bytes
+     */
+    public static int keyLength(final int cipherId) {
+        return cipherId == CIPHER_AES_256_CCM || cipherId == CIPHER_AES_256_GCM ? Smb3KeyDerivation.CIPHER_KEY_LENGTH_256
+                : Smb3KeyDerivation.CIPHER_KEY_LENGTH_128;
+    }
+
+    /**
+     * Refuses a key that is not the length the negotiated cipher calls for.
+     *
+     * <p>
+     * Nothing downstream would notice: the cipher takes the AES key size from the length of the key it is
+     * handed, so a 16-byte key under an AES-256 cipher id encrypts as AES-128 and succeeds. The session comes up,
+     * traffic flows, and the cipher the client believes it negotiated is not the one protecting the data.
+     * </p>
+     */
+    private void checkKeyLength(final String which, final byte[] key) {
+        final int required = keyLength(this.cipherId);
+        if (key.length != required) {
+            throw new IllegalArgumentException(String.format("Cipher 0x%04x requires a %d-byte %s key but was given %d bytes",
+                    this.cipherId, required, which, key.length));
+        }
     }
 
     /**
@@ -110,36 +149,21 @@ public class Smb2EncryptionContext {
     }
 
     /**
-     * Get the nonce length used by the negotiated cipher.
-     *
-     * Per MS-SMB2 2.2.41 the transform header carries a 16-byte nonce field,
-     * but only the cipher's nonce length is significant: 11 bytes for AES-CCM
-     * and 12 bytes for AES-GCM. The remainder of the field must be zero.
-     *
-     * @return the cipher nonce length in bytes
-     */
-    public int getNonceLength() {
-        return isGCMCipher() ? 12 : 11;
-    }
-
-    /**
      * Generate a unique nonce for encryption
      *
-     * @return nonce of the cipher's nonce length (see {@link #getNonceLength()})
+     * @return a nonce of the cipher's nonce length (see {@link #getNonceLength()})
      */
     public byte[] generateNonce() {
         final byte[] nonce = new byte[getNonceLength()];
+        System.arraycopy(this.noncePrefix, 0, nonce, 0, this.noncePrefix.length);
 
-        // Use combination of counter and random data for uniqueness; the counter
-        // alone already guarantees no reuse within this context's lifetime
-        final long counter = this.nonceCounter.incrementAndGet();
-        System.arraycopy(longToBytes(counter), 0, nonce, 0, 8);
-
-        // Fill the remaining bytes with random data
-        final byte[] randomBytes = new byte[nonce.length - 8];
-        this.secureRandom.nextBytes(randomBytes);
-        System.arraycopy(randomBytes, 0, nonce, 8, randomBytes.length);
-
+        // Big-endian counter in the trailing 8 bytes. MS-SMB2 2.2.41 requires that a nonce is never reused for a
+        // given key; a 64-bit counter cannot wrap within the lifetime of a session.
+        long counter = this.nonceCounter.incrementAndGet();
+        for (int i = nonce.length - 1; i >= this.noncePrefix.length; i--) {
+            nonce[i] = (byte) counter;
+            counter >>>= 8;
+        }
         return nonce;
     }
 
@@ -155,36 +179,65 @@ public class Smb2EncryptionContext {
      *             if encryption fails
      */
     public byte[] encryptMessage(final byte[] message, final long sessionId) throws CIFSException {
+        final byte[] result = new byte[Smb2TransformHeader.TRANSFORM_HEADER_SIZE + message.length];
+        encryptMessage(message, 0, message.length, sessionId, result, 0);
+        return result;
+    }
+
+    /**
+     * Encrypt an SMB2 message into a caller-supplied buffer.
+     *
+     * <p>
+     * Lets the caller reserve room in front of the transform header, so that the NetBIOS session header and the
+     * wrapped message can be written to the socket as a single buffer.
+     * </p>
+     *
+     * @param src
+     *            buffer holding the plaintext message
+     * @param srcOff
+     *            offset of the plaintext within {@code src}
+     * @param srcLen
+     *            length of the plaintext
+     * @param sessionId
+     *            session identifier
+     * @param dst
+     *            destination buffer, which must hold {@link Smb2TransformHeader#TRANSFORM_HEADER_SIZE} +
+     *            {@code srcLen} bytes from {@code dstOff}
+     * @param dstOff
+     *            offset to write the transform header at
+     * @return the number of bytes written at {@code dstOff}
+     * @throws CIFSException
+     *             if encryption fails
+     */
+    public int encryptMessage(final byte[] src, final int srcOff, final int srcLen, final long sessionId, final byte[] dst,
+            final int dstOff) throws CIFSException {
         try {
             final byte[] nonce = generateNonce();
-            final int flags = getTransformFlags();
 
-            // the transform header nonce field is 16 bytes, zero-padded beyond the
-            // cipher's nonce length (MS-SMB2 2.2.41)
-            final Smb2TransformHeader transformHeader = new Smb2TransformHeader(Arrays.copyOf(nonce, 16), message.length, flags, sessionId);
-            final byte[] associatedData = transformHeader.getAssociatedData();
+            // The transform header carries a 16-byte nonce field; everything beyond the cipher's nonce length must
+            // be zero (MS-SMB2 2.2.41).
+            final byte[] nonceField = new byte[16];
+            System.arraycopy(nonce, 0, nonceField, 0, nonce.length);
 
-            final Cipher cipher = createCipher(true, nonce);
-            cipher.updateAAD(associatedData);
-            final byte[] encrypted = cipher.doFinal(message);
+            final Smb2TransformHeader transformHeader = new Smb2TransformHeader(nonceField, srcLen, getTransformFlags(), sessionId);
 
-            // Split ciphertext and authentication tag: the tag is carried in the
-            // transform header signature field, not appended to the payload
+            // Encode the header first, then authenticate the bytes that actually go on the wire rather than a
+            // reconstruction of the parsed fields. The signature lies before the authenticated region, so it can
+            // be filled in afterwards.
+            transformHeader.encode(dst, dstOff);
+            final byte[] associatedData =
+                    Arrays.copyOfRange(dst, dstOff + Smb2TransformHeader.AAD_OFFSET, dstOff + Smb2TransformHeader.TRANSFORM_HEADER_SIZE);
+
+            final Cipher cipher = createCipher(true, nonce, associatedData);
+            final byte[] output = new byte[cipher.getOutputSize(srcLen)];
+            final int len = cipher.doFinal(src, srcOff, srcLen, output, 0);
+
             final int tagLength = getAuthTagLength();
-            final byte[] ciphertext = new byte[encrypted.length - tagLength];
-            final byte[] authTag = new byte[tagLength];
-            System.arraycopy(encrypted, 0, ciphertext, 0, ciphertext.length);
-            System.arraycopy(encrypted, ciphertext.length, authTag, 0, tagLength);
+            final int ciphertextLength = len - tagLength;
+            System.arraycopy(output, ciphertextLength, dst, dstOff + Smb2TransformHeader.SIGNATURE_OFFSET, tagLength);
+            System.arraycopy(output, 0, dst, dstOff + Smb2TransformHeader.TRANSFORM_HEADER_SIZE, ciphertextLength);
 
-            // Set authentication tag in transform header
-            transformHeader.setSignature(authTag);
-
-            // Build final encrypted message
-            final byte[] result = new byte[Smb2TransformHeader.TRANSFORM_HEADER_SIZE + ciphertext.length];
-            transformHeader.encode(result, 0);
-            System.arraycopy(ciphertext, 0, result, Smb2TransformHeader.TRANSFORM_HEADER_SIZE, ciphertext.length);
-
-            return result;
+            return Smb2TransformHeader.TRANSFORM_HEADER_SIZE + ciphertextLength;
         } catch (final Exception e) {
             throw new CIFSException("Failed to encrypt message", e);
         }
@@ -200,76 +253,68 @@ public class Smb2EncryptionContext {
      *             if decryption fails
      */
     public byte[] decryptMessage(final byte[] encryptedMessage) throws CIFSException {
-        // Parse transform header
-        final Smb2TransformHeader transformHeader = Smb2TransformHeader.decode(encryptedMessage, 0);
-        checkTransformFlags(transformHeader.getFlags());
         try {
-            final byte[] associatedData = transformHeader.getAssociatedData();
-            // only the cipher's nonce length is used, the rest of the 16-byte
-            // field is padding to be ignored on receipt (MS-SMB2 2.2.41)
-            final byte[] nonce = Arrays.copyOf(transformHeader.getNonce(), getNonceLength());
+            if (encryptedMessage.length < Smb2TransformHeader.TRANSFORM_HEADER_SIZE) {
+                throw new CIFSException("Transform message shorter than its header");
+            }
+
+            final Smb2TransformHeader transformHeader = Smb2TransformHeader.decode(encryptedMessage, 0);
+            checkTransformFlags(transformHeader.getFlags());
             final byte[] authTag = transformHeader.getSignature();
 
-            // Extract ciphertext
+            // Authenticate the bytes exactly as received rather than re-encoding the parsed fields.
+            final byte[] associatedData =
+                    Arrays.copyOfRange(encryptedMessage, Smb2TransformHeader.AAD_OFFSET, Smb2TransformHeader.TRANSFORM_HEADER_SIZE);
+
+            // Only the leading bytes of the 16-byte nonce field are significant for the negotiated cipher.
+            final byte[] nonce = new byte[getNonceLength()];
+            System.arraycopy(transformHeader.getNonce(), 0, nonce, 0, nonce.length);
+
             final int ciphertextLength = encryptedMessage.length - Smb2TransformHeader.TRANSFORM_HEADER_SIZE;
-            final byte[] ciphertext = new byte[ciphertextLength];
-            System.arraycopy(encryptedMessage, Smb2TransformHeader.TRANSFORM_HEADER_SIZE, ciphertext, 0, ciphertextLength);
+            final byte[] input = new byte[ciphertextLength + authTag.length];
+            System.arraycopy(encryptedMessage, Smb2TransformHeader.TRANSFORM_HEADER_SIZE, input, 0, ciphertextLength);
+            System.arraycopy(authTag, 0, input, ciphertextLength, authTag.length);
 
-            final Cipher cipher = createCipher(false, nonce);
-            cipher.updateAAD(associatedData);
+            final Cipher cipher = createCipher(false, nonce, associatedData);
+            final byte[] output = new byte[cipher.getOutputSize(input.length)];
+            final int len = cipher.doFinal(input, 0, input.length, output, 0);
 
-            // Combine ciphertext and auth tag for decryption
-            final byte[] input = new byte[ciphertext.length + authTag.length];
-            System.arraycopy(ciphertext, 0, input, 0, ciphertext.length);
-            System.arraycopy(authTag, 0, input, ciphertext.length, authTag.length);
+            // MS-SMB2 3.2.5.1.1: the header has to agree with what came out of the cipher. The AEAD tag only
+            // proves the field is authentic, not that the server filled it in consistently.
+            final int originalMessageSize = transformHeader.getOriginalMessageSize();
+            if (originalMessageSize != len) {
+                throw new CIFSException(
+                        "Transform header declares " + originalMessageSize + " plaintext bytes but " + len + " were decrypted");
+            }
 
-            return cipher.doFinal(input);
+            return output;
+        } catch (final CIFSException e) {
+            throw e;
         } catch (final Exception e) {
             throw new CIFSException("Failed to decrypt message", e);
         }
     }
 
-    /**
-     * Validate the Flags/EncryptionAlgorithm field of a received transform
-     * header against the negotiated cipher, per MS-SMB2 3.2.5.1.1.1: for
-     * SMB 3.1.1 the field must be exactly 0x0001 (Encrypted), for SMB 3.0.x it
-     * must equal the negotiated encryption algorithm.
-     *
-     * @param flags received Flags/EncryptionAlgorithm value
-     * @throws CIFSException if the message must be discarded
-     */
-    private void checkTransformFlags(final int flags) throws CIFSException {
-        if (this.dialect.atLeast(DialectVersion.SMB311)) {
-            if (flags != TRANSFORM_FLAG_ENCRYPTED) {
-                throw new CIFSException("Invalid transform header flags 0x" + Integer.toHexString(flags));
-            }
-        } else if (flags != this.cipherId) {
-            throw new CIFSException(
-                    "Transform header encryption algorithm 0x" + Integer.toHexString(flags) + " does not match the negotiated cipher");
-        }
-    }
-
     private boolean isGCMCipher() {
+        // Set membership rather than equality with the 128-bit id: AES-256-GCM would otherwise fall through to the
+        // CCM branch and be built as a CCM cipher with an 11-byte nonce. getNonceLength() is also called from the
+        // constructor to size the nonce prefix, so a misclassification is wrong from construction onwards.
         return this.cipherId == CIPHER_AES_128_GCM || this.cipherId == CIPHER_AES_256_GCM;
-    }
-
-    /**
-     * Get the key length for a cipher identifier.
-     *
-     * @param cipherId cipher identifier from the encryption negotiate context
-     * @return the cipher's key length in bytes
-     * @throws IllegalArgumentException for an unsupported cipher
-     */
-    public static int getKeyLength(final int cipherId) {
-        return switch (cipherId) {
-        case CIPHER_AES_128_CCM, CIPHER_AES_128_GCM -> 16;
-        case CIPHER_AES_256_CCM, CIPHER_AES_256_GCM -> 32;
-        default -> throw new IllegalArgumentException("Unsupported cipher: " + cipherId);
-        };
     }
 
     private int getAuthTagLength() {
         return 16; // All SMB3 ciphers use 16-byte authentication tags
+    }
+
+    /**
+     * Rejects a transform header whose Flags/EncryptionAlgorithm field does not describe the message this context
+     * is able to decrypt (MS-SMB2 2.2.41, 3.2.5.1.1).
+     */
+    private void checkTransformFlags(final int flags) throws CIFSException {
+        final int expected = getTransformFlags();
+        if (flags != expected) {
+            throw new CIFSException(String.format("Unexpected transform header flags 0x%04x, expected 0x%04x", flags, expected));
+        }
     }
 
     private int getTransformFlags() {
@@ -281,32 +326,34 @@ public class Smb2EncryptionContext {
     }
 
     /**
-     * Create an initialized AEAD cipher for the negotiated algorithm.
+     * Nonce length in bytes for the negotiated cipher.
      *
-     * Both ciphers are obtained through JCE from the provider configured via
-     * {@link Crypto#getProvider()}, so an installed custom provider (e.g. a
-     * FIPS-validated one) is honoured for the AEAD operations as well.
-     * GCMParameterSpec doubles as the parameter spec for CCM, carrying the
-     * nonce and tag length.
+     * <p>
+     * MS-SMB2 2.2.41: AES-CCM uses an 11-byte nonce and AES-GCM a 12-byte nonce, both carried in a 16-byte field
+     * whose remaining bytes are zero.
+     * </p>
      *
-     * @param encrypt whether to initialize for encryption (true) or decryption
-     * @param nonce nonce of the cipher's nonce length
-     * @return initialized cipher
+     * @return the significant nonce length
      */
-    private Cipher createCipher(final boolean encrypt, final byte[] nonce) throws GeneralSecurityException {
+    public int getNonceLength() {
+        return isGCMCipher() ? 12 : 11;
+    }
+
+    /**
+     * Both ciphers are obtained through JCE from the provider configured via {@link Crypto#getProvider()}, so an
+     * installed custom provider (e.g. a FIPS-validated one) is honoured for the AEAD operations as well. SunJCE does
+     * not implement AES/CCM, which is why the provider argument matters. GCMParameterSpec doubles as the parameter
+     * spec for CCM, carrying the nonce and tag length.
+     */
+    private Cipher createCipher(final boolean forEncryption, final byte[] nonce, final byte[] associatedData)
+            throws GeneralSecurityException {
         final String transformation = isGCMCipher() ? "AES/GCM/NoPadding" : "AES/CCM/NoPadding";
         final Cipher cipher = Cipher.getInstance(transformation, Crypto.getProvider());
-        final SecretKeySpec keySpec = new SecretKeySpec(encrypt ? this.encryptionKey : this.decryptionKey, "AES");
-        final GCMParameterSpec spec = new GCMParameterSpec(getAuthTagLength() * 8, nonce);
-        cipher.init(encrypt ? Cipher.ENCRYPT_MODE : Cipher.DECRYPT_MODE, keySpec, spec);
+        final SecretKeySpec keySpec = new SecretKeySpec(forEncryption ? this.encryptionKey : this.decryptionKey, "AES");
+        cipher.init(forEncryption ? Cipher.ENCRYPT_MODE : Cipher.DECRYPT_MODE, keySpec,
+                new GCMParameterSpec(getAuthTagLength() * 8, nonce));
+        cipher.updateAAD(associatedData);
         return cipher;
     }
 
-    private static byte[] longToBytes(final long value) {
-        final byte[] bytes = new byte[8];
-        for (int i = 0; i < 8; i++) {
-            bytes[i] = (byte) (value >>> 8 * (7 - i));
-        }
-        return bytes;
-    }
 }

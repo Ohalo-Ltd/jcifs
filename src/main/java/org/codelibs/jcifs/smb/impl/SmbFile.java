@@ -33,6 +33,7 @@ import org.codelibs.jcifs.smb.CloseableIterator;
 import org.codelibs.jcifs.smb.Configuration;
 import org.codelibs.jcifs.smb.ResourceFilter;
 import org.codelibs.jcifs.smb.ResourceNameFilter;
+import org.codelibs.jcifs.smb.RuntimeCIFSException;
 import org.codelibs.jcifs.smb.SmbConstants;
 import org.codelibs.jcifs.smb.SmbFileHandle;
 import org.codelibs.jcifs.smb.SmbResource;
@@ -80,6 +81,7 @@ import org.codelibs.jcifs.smb.internal.smb1.trans2.Trans2SetFileInformationRespo
 import org.codelibs.jcifs.smb.internal.smb2.ServerMessageBlock2Request;
 import org.codelibs.jcifs.smb.internal.smb2.ServerMessageBlock2Response;
 import org.codelibs.jcifs.smb.internal.smb2.Smb2Constants;
+import org.codelibs.jcifs.smb.internal.smb2.create.QueryMaximalAccessRequest;
 import org.codelibs.jcifs.smb.internal.smb2.create.Smb2CloseRequest;
 import org.codelibs.jcifs.smb.internal.smb2.create.Smb2CloseResponse;
 import org.codelibs.jcifs.smb.internal.smb2.create.Smb2CreateRequest;
@@ -377,6 +379,16 @@ public class SmbFile extends URLConnection implements SmbResource, SmbConstants 
     private long sizeExpiration;
     private boolean isExists;
 
+    /**
+     * The access the server reported on the open that last read the attributes.
+     * Only meaningful while {@code grantedAccessKnown} is set: not knowing what
+     * access is granted is a different thing from being granted nothing, so the
+     * two are kept apart rather than folded into a zero mask. Both are governed
+     * by {@code attrExpiration}, the way the attributes themselves are.
+     */
+    private int grantedAccess;
+    private boolean grantedAccessKnown;
+
     private final CIFSContext transportContext;
     private SmbTreeConnection treeConnection;
     /**
@@ -419,6 +431,9 @@ public class SmbFile extends URLConnection implements SmbResource, SmbConstants 
      * as a file or directory. The second parameter is a relative path from
      * the <code>parent SmbFile</code>. See the description above for examples
      * of using the second <code>name</code> parameter.
+     * <p>
+     * The <code>context</code> is always treated as the directory the name is resolved in, even if its URL does not
+     * carry the trailing slash that a directory URL is required to have.
      *
      * @param context
      *            A base <code>SmbFile</code> that serves as the parent resource
@@ -432,7 +447,7 @@ public class SmbFile extends URLConnection implements SmbResource, SmbConstants 
      */
     public SmbFile(final SmbResource context, final String name) throws MalformedURLException, UnknownHostException {
         this(isWorkgroup(context) ? new URL(null, "smb://" + checkName(name), context.getContext().getUrlHandler())
-                : new URL(context.getLocator().getURL(), encodeRelativePath(checkName(name)), context.getContext().getUrlHandler()),
+                : new URL(getBaseURL(context), encodeRelativePath(checkName(name)), context.getContext().getUrlHandler()),
                 context.getContext());
         setContext(context, name);
     }
@@ -470,8 +485,7 @@ public class SmbFile extends URLConnection implements SmbResource, SmbConstants 
     SmbFile(final SmbResource context, final String name, final boolean loadedAttributes, final int type, final int attributes,
             final long createTime, final long lastModified, final long lastAccess, final long size) throws MalformedURLException {
         this(isWorkgroup(context) ? new URL(null, "smb://" + checkName(name) + "/", context.getContext().getUrlHandler())
-                : new URL(context.getLocator().getURL(),
-                        encodeRelativePath(checkName(name)) + ((attributes & ATTR_DIRECTORY) > 0 ? "/" : "")),
+                : new URL(getBaseURL(context), encodeRelativePath(checkName(name)) + ((attributes & ATTR_DIRECTORY) > 0 ? "/" : "")),
                 context.getContext());
 
         if (!isWorkgroup(context)) {
@@ -493,6 +507,29 @@ public class SmbFile extends URLConnection implements SmbResource, SmbConstants 
         if (loadedAttributes) {
             this.attrExpiration = this.sizeExpiration = System.currentTimeMillis() + getContext().getConfig().getAttributeCacheTimeout();
         }
+    }
+
+    /**
+     * Returns the URL a relative child name has to be resolved against.
+     *
+     * <p>
+     * Relative resolution as implemented by {@link URL} replaces the last path segment when the base does not end with a
+     * slash. A parent resource always has to be treated as a directory here, otherwise the child would silently be
+     * resolved as a sibling and diverge from the UNC path built by
+     * {@link SmbResourceLocatorImpl#resolveInContext(org.codelibs.jcifs.smb.SmbResourceLocator, String)}.
+     * </p>
+     *
+     * @param context the parent resource
+     * @return the parent URL in directory form
+     * @throws MalformedURLException if the directory form of the parent URL cannot be constructed
+     */
+    private static URL getBaseURL(final SmbResource context) throws MalformedURLException {
+        final URL u = context.getLocator().getURL();
+        final String path = u.getPath();
+        if (path == null || path.isEmpty() || path.charAt(path.length() - 1) == '/') {
+            return u;
+        }
+        return new URL(u, path + "/", context.getContext().getUrlHandler());
     }
 
     private static String encodeRelativePath(String name) {
@@ -686,6 +723,11 @@ public class SmbFile extends URLConnection implements SmbResource, SmbConstants 
                 info = resp;
                 fileSize = resp.getEndOfFile();
                 fh = new SmbFileHandleImpl(config, resp.getFileId(), h, uncPath, flags, access, 0, 0, resp.getEndOfFile());
+                // An oplock break names nothing but the file id, so the open has to be findable by it. getSession()
+                // hands out an acquired reference, hence the try-with-resources.
+                try (SmbSessionImpl session = h.getSession()) {
+                    fh.registerWith(session, resp.getOplockLevel());
+                }
             } else if (h.hasCapability(SmbConstants.CAP_NT_SMBS)) {
                 final SmbComNTCreateAndXResponse resp = new SmbComNTCreateAndXResponse(config);
                 final SmbComNTCreateAndX req = new SmbComNTCreateAndX(config, uncPath, flags, access, sharing, attrs, options, null);
@@ -740,6 +782,9 @@ public class SmbFile extends URLConnection implements SmbResource, SmbConstants 
                 this.lastAccess = info.getLastAccessTime();
                 this.attributes = info.getAttributes() & ATTR_GET_MASK;
                 this.attrExpiration = attrTimeout;
+                // This open asked for a particular access rather than for a report of
+                // one, so what the server granted here says nothing about the rest.
+                recordGrantedAccess(null);
             }
 
             this.isExists = true;
@@ -795,6 +840,8 @@ public class SmbFile extends URLConnection implements SmbResource, SmbConstants 
             }
             final BasicFileInformation info = response.getInfo(BasicFileInformation.class);
             this.isExists = true;
+            // SMB1 has no way to ask what access is granted.
+            recordGrantedAccess(null);
             if (info instanceof FileBasicInfo) {
                 this.attributes = info.getAttributes() & ATTR_GET_MASK;
                 this.createTime = info.getCreateTime();
@@ -818,6 +865,7 @@ public class SmbFile extends URLConnection implements SmbResource, SmbConstants 
         }
 
         this.isExists = true;
+        recordGrantedAccess(null);
         this.attributes = response.getAttributes() & ATTR_GET_MASK;
         this.lastModified = response.getLastWriteTime();
         this.attrExpiration = System.currentTimeMillis() + th.getConfig().getAttributeCacheTimeout();
@@ -840,6 +888,7 @@ public class SmbFile extends URLConnection implements SmbResource, SmbConstants 
         this.lastModified = 0L;
         this.lastAccess = 0L;
         this.isExists = false;
+        recordGrantedAccess(null);
 
         try {
             if (this.url.getHost().length() == 0) {} else if (this.fileLocator.getShare() == null) {
@@ -1033,7 +1082,10 @@ public class SmbFile extends URLConnection implements SmbResource, SmbConstants 
         if (getType() == TYPE_NAMED_PIPE) { // try opening the pipe for reading?
             return true;
         }
-        return exists(); // try opening and catch sharing violation?
+        // exists() first, and not only because a file that is not there cannot be
+        // read: it is what fetches the access the server grants, so the check below
+        // has nothing to consult until it has run.
+        return exists() && grants(FILE_READ_DATA | GENERIC_READ | GENERIC_ALL);
     }
 
     @Override
@@ -1041,7 +1093,38 @@ public class SmbFile extends URLConnection implements SmbResource, SmbConstants 
         if (getType() == TYPE_NAMED_PIPE) { // try opening the pipe for writing?
             return true;
         }
-        return exists() && (this.attributes & ATTR_READONLY) == 0;
+        return exists() && (this.attributes & ATTR_READONLY) == 0
+                && grants(FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL);
+    }
+
+    /**
+     * Whether the access the server last reported includes any of the given rights.
+     *
+     * <p>
+     * A server that reported no access at all is answered {@code true}: not knowing
+     * what is granted is not the same as knowing nothing is, and reporting a file
+     * unreadable on that basis would hide files this client can in fact read. The
+     * generic rights are accepted alongside the specific ones because a server is
+     * free to answer in either form, and both servers this is tested against answer
+     * in the specific form.
+     * </p>
+     *
+     * @param access the rights to look for
+     * @return true unless the server said this caller has none of them
+     */
+    private boolean grants(final int access) {
+        return !this.grantedAccessKnown || (this.grantedAccess & access) != 0;
+    }
+
+    /**
+     * Records what the server reported about this caller's access, alongside the
+     * attributes from the same open.
+     *
+     * @param granted the reported access, or null if the server reported none
+     */
+    private void recordGrantedAccess(final Integer granted) {
+        this.grantedAccessKnown = granted != null;
+        this.grantedAccess = granted != null ? granted.intValue() : 0;
     }
 
     @Override
@@ -1456,6 +1539,14 @@ public class SmbFile extends URLConnection implements SmbResource, SmbConstants 
                     if (se.getNtStatus() != NtStatus.NT_STATUS_NO_SUCH_FILE) {
                         throw se;
                     }
+                } catch (final RuntimeCIFSException e) {
+                    // A listing that failed part way through leaves entries behind, so the delete has not succeeded.
+                    // The same tolerance as above applies, since the failure can arrive either way.
+                    final SmbException se = SmbEnumerationUtil.wrapEnumerationFailure(e);
+                    log.debug("delete", se);
+                    if (se.getNtStatus() != NtStatus.NT_STATUS_NO_SUCH_FILE) {
+                        throw se;
+                    }
                 }
 
                 if (th.isSMB2()) {
@@ -1694,6 +1785,11 @@ public class SmbFile extends URLConnection implements SmbResource, SmbConstants 
             cr.setFileAttributes(fileAttributes);
             cr.setDesiredAccess(desiredAccess);
             cr.setShareAccess(shareAccess);
+            // Asked for on the open that reads the attributes, because the attributes
+            // do not carry it: a file the caller may not read looks exactly like one
+            // it may, and only the server can say which it is. It costs no round trip
+            // and a server that will not answer simply leaves it out.
+            cr.setCreateContexts(new QueryMaximalAccessRequest());
 
             ServerMessageBlock2Request<?> cur = cr;
 
@@ -1728,6 +1824,7 @@ public class SmbFile extends URLConnection implements SmbResource, SmbConstants 
             this.lastAccess = info.getLastAccessTime();
             this.attributes = info.getAttributes() & ATTR_GET_MASK;
             this.attrExpiration = System.currentTimeMillis() + th.getConfig().getAttributeCacheTimeout();
+            recordGrantedAccess(createResp.getMaximalAccess());
 
             this.size = info.getSize();
             this.sizeExpiration = System.currentTimeMillis() + th.getConfig().getAttributeCacheTimeout();

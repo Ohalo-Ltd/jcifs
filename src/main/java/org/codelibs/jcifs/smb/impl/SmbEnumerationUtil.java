@@ -32,6 +32,7 @@ import org.codelibs.jcifs.smb.CIFSException;
 import org.codelibs.jcifs.smb.CloseableIterator;
 import org.codelibs.jcifs.smb.ResourceFilter;
 import org.codelibs.jcifs.smb.ResourceNameFilter;
+import org.codelibs.jcifs.smb.RuntimeCIFSException;
 import org.codelibs.jcifs.smb.SmbConstants;
 import org.codelibs.jcifs.smb.SmbResource;
 import org.codelibs.jcifs.smb.SmbResourceLocator;
@@ -62,8 +63,17 @@ final class SmbEnumerationUtil {
 
     private static DcerpcHandle getHandle(final CIFSContext ctx, final SmbResourceLocator loc, final Address address, final String ep)
             throws MalformedURLException, DcerpcException {
-        return DcerpcHandle.getHandle(String.format("ncacn_np:%s[endpoint=%s,address=%s]", loc.getServer(), ep, address.getHostAddress()),
-                ctx);
+        // The binding becomes smb://<server>/IPC$/<endpoint>, so a server named
+        // without its port reaches 445 - a different server, or nothing at all,
+        // whenever the URL asked for another one. SmbFile.getShareSecurity carries
+        // the port over for the same reason. A DFS path is excluded there and here
+        // alike: the port belongs to the address the URL named, not to whatever
+        // host a referral sends the request to.
+        String server = loc.getServer();
+        if (loc.getDfsPath() == null && loc.getPort() != -1) {
+            server = server + ":" + loc.getPort();
+        }
+        return DcerpcHandle.getHandle(String.format("ncacn_np:%s[endpoint=%s,address=%s]", server, ep, address.getHostAddress()), ctx);
     }
 
     static FileEntry[] doDfsRootEnum(final CIFSContext ctx, final SmbResourceLocator loc, final Address address) throws IOException {
@@ -248,9 +258,36 @@ final class SmbEnumerationUtil {
                 }
             }
             return list.toArray(new String[list.size()]);
+        } catch (final RuntimeCIFSException e) {
+            throw wrapEnumerationFailure(e);
         } catch (final CIFSException e) {
             throw SmbException.wrap(e);
         }
+    }
+
+    /**
+     * Converts a listing failure into the checked exception this class's callers declare.
+     *
+     * <p>
+     * A listing iterator reports a failure as an unchecked exception, because {@link java.util.Iterator#next()} cannot
+     * throw a checked one. The methods that return an array hide the iterator from their callers, so they keep
+     * reporting {@link SmbException}.
+     * </p>
+     *
+     * @param e the failure the iterator reported
+     * @return the equivalent checked exception
+     */
+    static SmbException wrapEnumerationFailure(final RuntimeCIFSException e) {
+        final Throwable cause = e.getCause();
+        if (!(cause instanceof CIFSException)) {
+            return new SmbException(e.getMessage(), e);
+        }
+        final SmbException wrapped = SmbException.wrap((CIFSException) cause);
+        // Carry over anything the iterator attached, such as a failure to close the listing it was giving up on
+        for (final Throwable suppressed : e.getSuppressed()) {
+            wrapped.addSuppressed(suppressed);
+        }
+        return wrapped;
     }
 
     static SmbFile[] listFiles(final SmbFile root, final String wildcard, final int searchAttributes, final SmbFilenameFilter fnf,
@@ -267,6 +304,8 @@ final class SmbEnumerationUtil {
                 }
             }
             return list.toArray(new SmbFile[list.size()]);
+        } catch (final RuntimeCIFSException e) {
+            throw wrapEnumerationFailure(e);
         } catch (final CIFSException e) {
             throw SmbException.wrap(e);
         }

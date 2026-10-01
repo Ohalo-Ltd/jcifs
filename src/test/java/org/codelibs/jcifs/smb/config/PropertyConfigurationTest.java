@@ -1,12 +1,11 @@
 /*
- * Modified by Ohalo Ltd on 2026-08-17: cover the encryptionRequired and encryptionCiphers
- * properties.
+ * Modified by Ohalo Ltd on 2026-10-01: cover the encryptionRequired property.
  */
 
 package org.codelibs.jcifs.smb.config;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -156,6 +155,87 @@ class PropertyConfigurationTest extends BaseTest {
     }
 
     @Test
+    @DisplayName("signingAlgorithms parses algorithm names to ids, keeping the configured order")
+    void testSigningAlgorithmsProperty() throws CIFSException {
+        final Properties props = new Properties();
+        props.setProperty("jcifs.client.signingAlgorithms", "AES-GMAC, HMAC-SHA256");
+
+        final PropertyConfiguration testConfig = new PropertyConfiguration(props);
+
+        assertArrayEquals(new int[] { 0x2, 0x0 }, testConfig.getSigningAlgorithms(),
+                "configured algorithm names must map to their MS-SMB2 ids in the configured order");
+    }
+
+    @Test
+    @DisplayName("signingAlgorithms defaults to AES-CMAC first, leaving existing behaviour unchanged")
+    void testSigningAlgorithmsDefault() throws CIFSException {
+        final PropertyConfiguration testConfig = new PropertyConfiguration(new Properties());
+
+        // AES-CMAC leads deliberately. A server picks from the client's offer by its own preference - the Samba
+        // fixture lists AES-128-GMAC first - so leading with CMAC keeps the algorithm an existing deployment
+        // negotiates exactly as it is today, while making GMAC reachable for anyone who asks for it.
+        assertArrayEquals(new int[] { 0x1, 0x2, 0x0 }, testConfig.getSigningAlgorithms(),
+                "the default offer must be AES-CMAC, AES-GMAC, HMAC-SHA256");
+    }
+
+    @Test
+    @DisplayName("an unknown signing algorithm name is refused rather than silently dropped")
+    void testSigningAlgorithmsRejectsUnknownName() {
+        final Properties props = new Properties();
+        props.setProperty("jcifs.client.signingAlgorithms", "AES-CMAC, AES-512-GMAC");
+
+        assertThrows(CIFSException.class, () -> new PropertyConfiguration(props),
+                "an unrecognised signing algorithm name must fail configuration rather than be ignored");
+    }
+
+    @Test
+    @DisplayName("encryptionRequired is parsed from jcifs.client.encryptionRequired, defaulting to false")
+    void testEncryptionRequiredProperty() throws CIFSException {
+        assertFalse(new PropertyConfiguration(new Properties()).isEncryptionRequired());
+
+        final Properties props = new Properties();
+        props.setProperty("jcifs.client.encryptionRequired", "true");
+        assertTrue(new PropertyConfiguration(props).isEncryptionRequired());
+    }
+
+    @Test
+    @DisplayName("encryptionCiphers parses cipher names to ids, keeping the configured order")
+    void testEncryptionCiphersProperty() throws CIFSException {
+        final Properties props = new Properties();
+        props.setProperty("jcifs.client.encryptionCiphers", "AES-256-GCM, AES-128-CCM");
+
+        final PropertyConfiguration testConfig = new PropertyConfiguration(props);
+
+        // Order is the client's stated preference on the wire, so it has to survive parsing.
+        assertArrayEquals(new int[] { 0x4, 0x1 }, testConfig.getEncryptionCiphers(),
+                "configured cipher names must map to their MS-SMB2 ids in the configured order");
+    }
+
+    @Test
+    @DisplayName("encryptionCiphers defaults to all four ciphers with AES-128 first")
+    void testEncryptionCiphersDefault() throws CIFSException {
+        final PropertyConfiguration testConfig = new PropertyConfiguration(new Properties());
+
+        // AES-128-GCM leads deliberately: servers choose from the client's offer by their own preference, so
+        // leading with AES-128 keeps the cipher an existing deployment negotiates exactly as it is today, while
+        // still making AES-256 available to a server that prefers it.
+        assertArrayEquals(new int[] { 0x2, 0x1, 0x4, 0x3 }, testConfig.getEncryptionCiphers(),
+                "the default offer must be AES-128-GCM, AES-128-CCM, AES-256-GCM, AES-256-CCM");
+    }
+
+    @Test
+    @DisplayName("an unknown cipher name is refused rather than silently dropped")
+    void testEncryptionCiphersRejectsUnknownName() {
+        final Properties props = new Properties();
+        props.setProperty("jcifs.client.encryptionCiphers", "AES-128-GCM, AES-512-GCM");
+
+        // Dropping the unrecognised entry would leave a client quietly offering something other than what was
+        // configured - and a typo in a security setting is exactly the case that must not fail open.
+        assertThrows(CIFSException.class, () -> new PropertyConfiguration(props),
+                "an unrecognised cipher name must fail configuration rather than be ignored");
+    }
+
+    @Test
     @DisplayName("Should handle encoding properties")
     void testEncodingProperties() throws CIFSException {
         // Given
@@ -222,39 +302,6 @@ class PropertyConfigurationTest extends BaseTest {
         assertTrue(testConfig.isSigningEnforced());
         assertTrue(testConfig.isSigningEnabled());
         assertFalse(testConfig.isEncryptionEnabled());
-    }
-
-    @Test
-    @DisplayName("Should parse jcifs.client.encryptionRequired, defaulting to false")
-    void testEncryptionRequiredProperty() throws CIFSException {
-        // default: not required
-        assertFalse(new PropertyConfiguration(new Properties()).isEncryptionRequired());
-
-        // explicit
-        Properties props = new Properties();
-        props.setProperty("jcifs.client.encryptionRequired", "true");
-        assertTrue(new PropertyConfiguration(props).isEncryptionRequired());
-    }
-
-    @Test
-    @DisplayName("Should parse jcifs.client.encryptionCiphers with the MS-SMB2 preference order default")
-    void testEncryptionCiphersProperty() throws CIFSException {
-        // default: all four ciphers, most preferred first per MS-SMB2 2.2.3.1.2
-        assertArrayEquals(new int[] { 0x04, 0x02, 0x03, 0x01 }, new PropertyConfiguration(new Properties()).getEncryptionCiphers());
-
-        // narrowing to a single cipher
-        Properties props = new Properties();
-        props.setProperty("jcifs.client.encryptionCiphers", "AES-256-GCM");
-        assertArrayEquals(new int[] { 0x04 }, new PropertyConfiguration(props).getEncryptionCiphers());
-
-        // case and separator tolerant
-        props.setProperty("jcifs.client.encryptionCiphers", "aes_128_gcm, AES-128-CCM");
-        assertArrayEquals(new int[] { 0x02, 0x01 }, new PropertyConfiguration(props).getEncryptionCiphers());
-
-        // unknown names are rejected
-        Properties bad = new Properties();
-        bad.setProperty("jcifs.client.encryptionCiphers", "ROT13");
-        assertThrows(CIFSException.class, () -> new PropertyConfiguration(bad));
     }
 
     @Test
@@ -348,7 +395,7 @@ class PropertyConfigurationTest extends BaseTest {
     void testPreserveShareCaseTrue() throws CIFSException {
         // Given
         Properties props = new Properties();
-        props.setProperty("jcifs.smb.client.preserveShareCase", "true");
+        props.setProperty("jcifs.client.preserveShareCase", "true");
 
         // When
         PropertyConfiguration testConfig = new PropertyConfiguration(props);
@@ -362,7 +409,7 @@ class PropertyConfigurationTest extends BaseTest {
     void testPreserveShareCaseFalse() throws CIFSException {
         // Given
         Properties props = new Properties();
-        props.setProperty("jcifs.smb.client.preserveShareCase", "false");
+        props.setProperty("jcifs.client.preserveShareCase", "false");
 
         // When
         PropertyConfiguration testConfig = new PropertyConfiguration(props);
@@ -383,5 +430,55 @@ class PropertyConfigurationTest extends BaseTest {
 
         // Then
         assertFalse(testConfig.isPreserveShareCase());
+    }
+
+    @Test
+    @DisplayName("Should still honour the deprecated preserveShareCase spelling")
+    void testPreserveShareCaseLegacyKey() throws CIFSException {
+        // Given
+        Properties props = new Properties();
+        props.setProperty("jcifs.smb.client.preserveShareCase", "true");
+
+        // When
+        PropertyConfiguration testConfig = new PropertyConfiguration(props);
+
+        // Then
+        assertTrue(testConfig.isPreserveShareCase());
+    }
+
+    @Test
+    @DisplayName("Should let the current preserveShareCase key win over the deprecated one")
+    void testPreserveShareCaseCurrentKeyWins() throws CIFSException {
+        // Given
+        Properties props = new Properties();
+        props.setProperty("jcifs.smb.client.preserveShareCase", "true");
+        props.setProperty("jcifs.client.preserveShareCase", "false");
+
+        // When
+        PropertyConfiguration testConfig = new PropertyConfiguration(props);
+
+        // Then
+        assertFalse(testConfig.isPreserveShareCase());
+    }
+
+    @Test
+    @DisplayName("Should ignore properties carrying a pre-3.0.0 prefix")
+    void testLegacyPrefixesAreIgnored() throws CIFSException {
+        // Given
+        Properties props = new Properties();
+        props.setProperty("jcifs.smb.client.connTimeout", "12345");
+        props.setProperty("jcifs.smb1.smb.client.soTimeout", "12345");
+        props.setProperty("org.codelibs.jcifs.smb.impl.client.responseTimeout", "12345");
+        props.setProperty("jcifs.smb.lmCompatibility", "0");
+
+        // When
+        PropertyConfiguration testConfig = new PropertyConfiguration(props);
+        PropertyConfiguration defaults = new PropertyConfiguration(new Properties());
+
+        // Then
+        assertEquals(defaults.getConnTimeout(), testConfig.getConnTimeout());
+        assertEquals(defaults.getSoTimeout(), testConfig.getSoTimeout());
+        assertEquals(defaults.getResponseTimeout(), testConfig.getResponseTimeout());
+        assertEquals(defaults.getLanManCompatibility(), testConfig.getLanManCompatibility());
     }
 }
