@@ -153,6 +153,12 @@ public class Smb3KerberosEncryptionIntegrationTest {
             mkdir -p /share/enc
             chmod 0777 /share/enc
 
+            # Provisioning happens at image build time and Docker caches the layer, so
+            # the password is as old as the cached image. Without this, the default
+            # 42-day maximum password age expires it and every login fails with
+            # "Password has expired".
+            samba-tool domain passwordsettings set --max-pwd-age=0
+
             samba-tool user create USER_PLACEHOLDER 'USERPASS_PLACEHOLDER' --given-name=Enc --surname=User
 
             # The client reaches the DC through a mapped port on localhost, so the
