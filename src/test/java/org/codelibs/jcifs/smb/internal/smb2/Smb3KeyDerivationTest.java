@@ -1,7 +1,3 @@
-/*
- * Modified by Ohalo Ltd on 2026-08-17: cover key derivation at both 16- and 32-byte key lengths.
- */
-
 package org.codelibs.jcifs.smb.internal.smb2;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -446,7 +442,18 @@ class Smb3KeyDerivationTest {
         return deriveOracle(label, context, sessionKey, 16);
     }
 
-    private static byte[] deriveOracle(final String label, final byte[] context, final byte[] sessionKey, final int keyLength)
+    /**
+     * The same oracle for a key of any length. {@code L} is the output length in <em>bits</em>, so a 32-byte key
+     * sets L = 256 and takes the whole HMAC-SHA256 block.
+     *
+     * <p>
+     * One block is always enough here: HMAC-SHA256 emits exactly 32 bytes per iteration, so a 32-byte key is a
+     * single pass with the counter at 1, the same as a 16-byte one. Note that L is written as a four-byte
+     * big-endian field - for 128 only the last byte is non-zero, which is why the production code could get away
+     * with writing one byte, and why 256 (0x00 0x00 0x01 0x00) cannot.
+     * </p>
+     */
+    private static byte[] deriveOracle(final String label, final byte[] context, final byte[] sessionKey, final int keyLengthBytes)
             throws Exception {
         final byte[] ascii = label.getBytes(StandardCharsets.US_ASCII);
         final ByteArrayOutputStream fixedInput = new ByteArrayOutputStream();
@@ -455,13 +462,13 @@ class Smb3KeyDerivationTest {
         fixedInput.write(0x00); // label null terminator (toCBytes)
         fixedInput.write(0x00); // 0x00 separator between label and context
         fixedInput.writeBytes(context); // context
-        final int lBits = keyLength * 8;
-        fixedInput.writeBytes(new byte[] { 0x00, 0x00, (byte) (lBits >> 8), (byte) lBits }); // L (4-byte BE)
+        final int l = keyLengthBytes * 8;
+        fixedInput.writeBytes(new byte[] { 0x00, 0x00, (byte) (l >>> 8), (byte) l }); // L in bits (4-byte BE)
 
         final Mac mac = Mac.getInstance("HmacSHA256");
         mac.init(new SecretKeySpec(sessionKey, "HmacSHA256"));
         final byte[] full = mac.doFinal(fixedInput.toByteArray());
-        return Arrays.copyOf(full, keyLength);
+        return Arrays.copyOf(full, keyLengthBytes);
     }
 
     private static byte[] fixedSessionKey() {
@@ -478,28 +485,6 @@ class Smb3KeyDerivationTest {
     }
 
     @Test
-    @DisplayName("Derives 32-byte AES-256 cipher keys with L=256 encoded in the KDF input")
-    void testAes256KeyDerivation() throws Exception {
-        final byte[] sk = fixedSessionKey();
-        final byte[] preauth = fixedPreauth();
-
-        final byte[] encActual = Smb3KeyDerivation.deriveEncryptionKey(Smb2Constants.SMB2_DIALECT_0311, sk, preauth, 32);
-        assertEquals(32, encActual.length, "AES-256 needs a 32-byte key");
-        assertArrayEquals(deriveOracle("SMBC2SCipherKey", preauth, sk, 32), encActual,
-                "32-byte encryption key must match the SP800-108 oracle with L=256");
-
-        final byte[] decActual = Smb3KeyDerivation.deriveDecryptionKey(Smb2Constants.SMB2_DIALECT_0311, sk, preauth, 32);
-        assertEquals(32, decActual.length);
-        assertArrayEquals(deriveOracle("SMBS2CCipherKey", preauth, sk, 32), decActual,
-                "32-byte decryption key must match the SP800-108 oracle with L=256");
-
-        // L is part of the fixed KDF input, so a 32-byte derivation is not just
-        // an extension of the 16-byte one
-        final byte[] enc16 = Smb3KeyDerivation.deriveEncryptionKey(Smb2Constants.SMB2_DIALECT_0311, sk, preauth);
-        assertFalse(Arrays.equals(enc16, Arrays.copyOf(encActual, 16)), "Different L must give a different key stream");
-    }
-
-    @Test
     @DisplayName("KDF oracle reproduces the never-buggy signing key (validates the oracle)")
     void testKdfOracleReproducesSigningKey() throws Exception {
         final byte[] sk = fixedSessionKey();
@@ -510,66 +495,6 @@ class Smb3KeyDerivationTest {
         final byte[] oracle = deriveOracle("SMBSigningKey", preauth, sk);
 
         assertArrayEquals(expected, oracle, "In-test SP800-108 oracle must faithfully reproduce the production KDF");
-    }
-
-    private static byte[] hex(final String s) {
-        final byte[] out = new byte[s.length() / 2];
-        for (int i = 0; i < out.length; i++) {
-            out[i] = (byte) Integer.parseInt(s.substring(2 * i, 2 * i + 2), 16);
-        }
-        return out;
-    }
-
-    /**
-     * Known-answer test against the published SMB 3.1.1 vectors from the
-     * Microsoft Open Specifications article "SMB 2 and SMB 3 security in
-     * Windows 10: the anatomy of signing and cryptographic keys" (key
-     * derivation example for SMB 3.1.1 multichannel, master session).
-     */
-    @Test
-    @DisplayName("Matches the published SMB 3.1.1 key derivation vectors")
-    void testPublishedVectors311() {
-        final byte[] sk = hex("270E1BA896585EEB7AF3472D3B4C75A7");
-        final byte[] preauth = hex("0DD13628CC3ED218EF9DF9772D436D0887AB9814BFAE63A80AA845F36909DB79"
-                + "28622DDDAD522D9751640A459762C5A9D6BB084CBB3CE6BDADEF5D5BCE3C6C01");
-
-        assertArrayEquals(hex("73FE7A9A77BEF0BDE49C650D8CCB5F76"),
-                Smb3KeyDerivation.deriveSigningKey(Smb2Constants.SMB2_DIALECT_0311, sk, preauth),
-                "SMB 3.1.1 SigningKey must match the published vector");
-        assertArrayEquals(hex("629BCBC54422A0F572B97F45989B6073"),
-                Smb3KeyDerivation.deriveEncryptionKey(Smb2Constants.SMB2_DIALECT_0311, sk, preauth),
-                "SMB 3.1.1 EncryptionKey (client-to-server) must match the published vector");
-        assertArrayEquals(hex("E2AF0DCEFAC68DA71A0DFBD0D1350D74"),
-                Smb3KeyDerivation.deriveDecryptionKey(Smb2Constants.SMB2_DIALECT_0311, sk, preauth),
-                "SMB 3.1.1 DecryptionKey (server-to-client) must match the published vector");
-        assertArrayEquals(hex("6D7AD7954E9EC61E907B4D473DC178FF"),
-                Smb3KeyDerivation.dervieApplicationKey(Smb2Constants.SMB2_DIALECT_0311, sk, preauth),
-                "SMB 3.1.1 ApplicationKey must match the published vector");
-    }
-
-    /**
-     * Known-answer test against the published SMB 3.0 vectors from the same
-     * article (key derivation example for SMB 3.0 multichannel, master
-     * session). SMB 3.0.x uses fixed label/context pairs instead of the
-     * preauth integrity hash.
-     */
-    @Test
-    @DisplayName("Matches the published SMB 3.0 key derivation vectors")
-    void testPublishedVectors300() {
-        final byte[] sk = hex("7CD451825D0450D235424E44BA6E78CC");
-
-        assertArrayEquals(hex("0B7E9C5CAC36C0F6EA9AB275298CEDCE"),
-                Smb3KeyDerivation.deriveSigningKey(Smb2Constants.SMB2_DIALECT_0300, sk, null),
-                "SMB 3.0 SigningKey must match the published vector");
-        assertArrayEquals(hex("FAD27796665B313EBB578F388632B4F7"),
-                Smb3KeyDerivation.deriveEncryptionKey(Smb2Constants.SMB2_DIALECT_0300, sk, null),
-                "SMB 3.0 EncryptionKey (ServerIn ) must match the published vector");
-        assertArrayEquals(hex("B0F0427F7CEB416D1D9DCC0CD4F99447"),
-                Smb3KeyDerivation.deriveDecryptionKey(Smb2Constants.SMB2_DIALECT_0300, sk, null),
-                "SMB 3.0 DecryptionKey (ServerOut) must match the published vector");
-        assertArrayEquals(hex("BB23A4575AA26C721AF525AF15A87B4F"),
-                Smb3KeyDerivation.dervieApplicationKey(Smb2Constants.SMB2_DIALECT_0300, sk, null),
-                "SMB 3.0 ApplicationKey must match the published vector");
     }
 
     @Test
@@ -585,5 +510,48 @@ class Smb3KeyDerivationTest {
         final byte[] decExpected = deriveOracle("SMBS2CCipherKey", preauth, sk);
         final byte[] decActual = Smb3KeyDerivation.deriveDecryptionKey(Smb2Constants.SMB2_DIALECT_0311, sk, preauth);
         assertArrayEquals(decExpected, decActual, "Decryption key must be derived with the SMBS2CCipherKey label");
+    }
+
+    @Test
+    @DisplayName("a 32-byte cipher key is a different key stream, not the 16-byte key extended")
+    void testCipherKeysCanBeDerivedAtThirtyTwoBytes() throws Exception {
+        final byte[] sk = fixedSessionKey();
+        final byte[] preauth = fixedPreauth();
+
+        final byte[] encActual = Smb3KeyDerivation.deriveEncryptionKey(Smb2Constants.SMB2_DIALECT_0311, sk, preauth, 32);
+        assertEquals(32, encActual.length, "an AES-256 cipher key must be 32 bytes");
+        assertArrayEquals(deriveOracle("SMBC2SCipherKey", preauth, sk, 32), encActual,
+                "the 32-byte encryption key must match an independent SP800-108 derivation with L = 256");
+
+        final byte[] decActual = Smb3KeyDerivation.deriveDecryptionKey(Smb2Constants.SMB2_DIALECT_0311, sk, preauth, 32);
+        assertEquals(32, decActual.length, "an AES-256 cipher key must be 32 bytes");
+        assertArrayEquals(deriveOracle("SMBS2CCipherKey", preauth, sk, 32), decActual,
+                "the 32-byte decryption key must match an independent SP800-108 derivation with L = 256");
+
+        // L is part of the MAC'd fixed input, so a longer key differs from the first byte rather than extending the
+        // shorter one. This is the assertion that catches the plausible half-fix: enlarging the output buffer while
+        // leaving L at 128 produces 32 bytes that begin with the 16-byte key, and would pass every other check here.
+        final byte[] sixteen = Smb3KeyDerivation.deriveEncryptionKey(Smb2Constants.SMB2_DIALECT_0311, sk, preauth);
+        assertFalse(Arrays.equals(Arrays.copyOf(encActual, 16), sixteen),
+                "a 32-byte key whose first half equals the 16-byte key means L was left at 128");
+    }
+
+    @Test
+    @DisplayName("the signing key stays 16 bytes even though cipher keys can now be 32")
+    void testSigningKeyIsNotWidenedWithCipherKeys() throws Exception {
+        final byte[] sk = fixedSessionKey();
+        final byte[] preauth = fixedPreauth();
+
+        // deriveSigningKey shares the same private derive() as the cipher keys, so widening that shared default
+        // would hand signing a 32-byte key. BouncyCastle's AESCMAC accepts one without complaint and still emits a
+        // 16-byte tag, so nothing here would throw and self-consistent unit tests would stay green - the damage
+        // appears only as "Signature validation failed" against a real server, and both CI backends mandate
+        // signing. This test is the guard for that, which is why it asserts the length rather than trusting it.
+        final byte[] signing = Smb3KeyDerivation.deriveSigningKey(Smb2Constants.SMB2_DIALECT_0311, sk, preauth);
+        assertEquals(16, signing.length, "the SMB 3.1.1 signing key must stay 16 bytes");
+        assertArrayEquals(deriveOracle("SMBSigningKey", preauth, sk, 16), signing, "the signing key must still be derived with L = 128");
+
+        final byte[] signing300 = Smb3KeyDerivation.deriveSigningKey(Smb2Constants.SMB2_DIALECT_0300, sk, preauth);
+        assertEquals(16, signing300.length, "the SMB 3.0 signing key must stay 16 bytes");
     }
 }

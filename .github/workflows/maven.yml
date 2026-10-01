@@ -6,8 +6,9 @@ name: Java CI with Maven
 on:
   push:
     branches: [ main ]
+  # No base branch filter: a pull request stacked on another branch needs the
+  # same checks as one aimed straight at main.
   pull_request:
-    branches: [ main ]
 
 jobs:
   build:
@@ -22,4 +23,43 @@ jobs:
         java-version: '17'
         distribution: 'temurin'
     - name: Build with Maven
-      run: mvn -B package --file pom.xml
+      # verify also runs the *IT integration tests, which start a Samba
+      # container. JCIFS_IT_REQUIRED makes a missing or unusable environment a
+      # failure rather than a silent skip.
+      run: mvn -B verify --file pom.xml
+      env:
+        JCIFS_IT_REQUIRED: "true"
+    - name: Check that the integration tests actually ran
+      if: always()
+      run: python3 build_helpers/check-it-reports.py
+
+  # Same idea as the Windows dialect matrix: the build above negotiates freely
+  # and settles on SMB 3.1.1, so pin the range and run the integration tests
+  # again one dialect at a time. Samba is the backend that PRs always have, so
+  # this is where a dialect regression surfaces first.
+  samba-dialects:
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        dialect: [SMB202, SMB210, SMB300, SMB311]
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+    - name: Run the integration tests on ${{ matrix.dialect }}
+      # Only the integration tests talk to a server, so only they are affected
+      # by the dialect pin.
+      run: mvn -B verify -Dtest=NoSuchUnitTest -Dsurefire.failIfNoSpecifiedTests=false
+      env:
+        JCIFS_IT_REQUIRED: "true"
+        JCIFS_IT_DIALECT: ${{ matrix.dialect }}
+    - name: Check that the integration tests actually ran
+      if: always()
+      run: python3 build_helpers/check-it-reports.py

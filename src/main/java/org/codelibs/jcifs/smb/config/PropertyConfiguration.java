@@ -16,12 +16,13 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 /*
- * Modified by Ohalo Ltd on 2026-08-17: read the jcifs.client.encryptionRequired and
- * jcifs.client.encryptionCiphers properties.
+ * Modified by Ohalo Ltd on 2026-10-01: read the jcifs.client.encryptionRequired property.
  */
 package org.codelibs.jcifs.smb.config;
 
 import java.net.InetAddress;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Properties;
 
 import org.codelibs.jcifs.smb.CIFSException;
@@ -29,6 +30,8 @@ import org.codelibs.jcifs.smb.Config;
 import org.codelibs.jcifs.smb.Configuration;
 import org.codelibs.jcifs.smb.DialectVersion;
 import org.codelibs.jcifs.smb.SmbConstants;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Configuration implementation reading the classic org.codelibs.jcifs.smb settings from properties
@@ -37,6 +40,63 @@ import org.codelibs.jcifs.smb.SmbConstants;
  *
  */
 public final class PropertyConfiguration extends BaseConfiguration implements Configuration {
+
+    private static final Logger log = LoggerFactory.getLogger(PropertyConfiguration.class);
+
+    /** Property controlling whether share names keep the case they were given in. */
+    private static final String PRESERVE_SHARE_CASE = "jcifs.client.preserveShareCase";
+
+    /** Spelling of {@link #PRESERVE_SHARE_CASE} shipped in 3.0.1, still honoured. */
+    private static final String LEGACY_PRESERVE_SHARE_CASE = "jcifs.smb.client.preserveShareCase";
+
+    /**
+     * Property prefixes used before 3.0.0, mapped to the prefix that replaced them.
+     *
+     * Ordered longest first so that the most specific prefix wins.
+     */
+    private static final Map<String, String> LEGACY_PREFIXES = new LinkedHashMap<>();
+
+    static {
+        // 2.x legacy SMB1 stack
+        LEGACY_PREFIXES.put("jcifs.smb1.smb.client.", "jcifs.client.");
+        // names taken from the Configuration javadoc before it was corrected
+        LEGACY_PREFIXES.put("org.codelibs.jcifs.smb.impl.client.", "jcifs.client.");
+        LEGACY_PREFIXES.put("org.codelibs.jcifs.smb.impl.", "jcifs.");
+        // 2.x main stack
+        LEGACY_PREFIXES.put("jcifs.smb.client.", "jcifs.client.");
+        LEGACY_PREFIXES.put("jcifs.smb.", "jcifs.");
+    }
+
+    /**
+     * Warns about properties that carry a prefix this version no longer reads.
+     *
+     * Only the property names are logged, never their values, so that credentials
+     * carried by keys such as {@code jcifs.smb.client.password} are not exposed.
+     *
+     * @param p properties handed to this configuration
+     */
+    private static void warnLegacyPropertyNames(final Properties p) {
+        if (!log.isWarnEnabled()) {
+            return;
+        }
+        for (final String name : p.stringPropertyNames()) {
+            if (LEGACY_PRESERVE_SHARE_CASE.equals(name)) {
+                if (!p.containsKey(PRESERVE_SHARE_CASE)) {
+                    log.warn("Property '{}' is deprecated, use '{}' instead", name, PRESERVE_SHARE_CASE);
+                }
+                continue;
+            }
+            for (final Map.Entry<String, String> e : LEGACY_PREFIXES.entrySet()) {
+                if (name.startsWith(e.getKey())) {
+                    log.warn(
+                            "Property '{}' is not read by this version and has no effect. "
+                                    + "Configuration property prefixes changed in 3.0.0, use '{}' instead",
+                            name, e.getValue() + name.substring(e.getKey().length()));
+                    break;
+                }
+            }
+        }
+    }
 
     /**
      * Constructs a PropertyConfiguration from the provided properties.
@@ -47,6 +107,8 @@ public final class PropertyConfiguration extends BaseConfiguration implements Co
      *
      */
     public PropertyConfiguration(final Properties p) throws CIFSException {
+        warnLegacyPropertyNames(p);
+
         this.useBatching = Config.getBoolean(p, "jcifs.client.useBatching", false);
         this.useUnicode = Config.getBoolean(p, "jcifs.client.useUnicode", true);
         this.useLargeReadWrite = Config.getBoolean(p, "jcifs.client.useLargeReadWrite", true);
@@ -56,7 +118,9 @@ public final class PropertyConfiguration extends BaseConfiguration implements Co
         this.ipcSigningEnforced = Config.getBoolean(p, "jcifs.client.ipcSigningEnforced", true);
         this.encryptionEnabled = Config.getBoolean(p, "jcifs.client.encryptionEnabled", false);
         this.encryptionRequired = Config.getBoolean(p, "jcifs.client.encryptionRequired", false);
+        this.compressionEnabled = Config.getBoolean(p, "jcifs.client.compressionEnabled", false);
         initEncryptionCiphers(p.getProperty("jcifs.client.encryptionCiphers"));
+        initSigningAlgorithms(p.getProperty("jcifs.client.signingAlgorithms"));
         this.requireSecureNegotiate = Config.getBoolean(p, "jcifs.client.requireSecureNegotiate", true);
         this.sendNTLMTargetName = Config.getBoolean(p, "jcifs.client.SendNTLMTargetName", true);
 
@@ -107,10 +171,11 @@ public final class PropertyConfiguration extends BaseConfiguration implements Co
         this.vcNumber = 1;
 
         this.dfsDisabled = Config.getBoolean(p, "jcifs.client.dfs.disabled", false);
+        this.followSymlinks = Config.getBoolean(p, "jcifs.client.followSymlinks", false);
         this.dfsTTL = Config.getLong(p, "jcifs.client.dfs.ttl", 300);
         this.dfsStrictView = Config.getBoolean(p, "jcifs.client.dfs.strictView", false);
         this.dfsConvertToFqdn = Config.getBoolean(p, "jcifs.client.dfs.convertToFQDN", false);
-        this.preserveShareCase = Config.getBoolean(p, "jcifs.smb.client.preserveShareCase", false);
+        this.preserveShareCase = Config.getBoolean(p, PRESERVE_SHARE_CASE, Config.getBoolean(p, LEGACY_PRESERVE_SHARE_CASE, false));
 
         this.logonShare = p.getProperty("jcifs.client.logonShare", null);
 
@@ -136,6 +201,7 @@ public final class PropertyConfiguration extends BaseConfiguration implements Co
         this.winsServer = Config.getInetAddressArray(p, "jcifs.netbios.wins", ",", new InetAddress[0]);
 
         this.transactionBufferSize = Config.getInt(p, "jcifs.client.transaction_buf_size", 0xFFFF) - 512;
+        this.maximumTransferSize = Config.getInt(p, "jcifs.client.maxTransferSize", SmbConstants.DEFAULT_MAX_TRANSFER_SIZE);
         this.bufferCacheSize = Config.getInt(p, "jcifs.maxBuffers", 16);
 
         this.smbListSize = Config.getInt(p, "jcifs.client.listSize", 65435);

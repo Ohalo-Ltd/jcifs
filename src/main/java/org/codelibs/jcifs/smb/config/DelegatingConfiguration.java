@@ -16,8 +16,7 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 /*
- * Modified by Ohalo Ltd on 2026-08-17: delegate the encryptionRequired and encryptionCiphers
- * properties.
+ * Modified by Ohalo Ltd on 2026-10-01: delegate isEncryptionRequired().
  */
 package org.codelibs.jcifs.smb.config;
 
@@ -153,6 +152,16 @@ public class DelegatingConfiguration implements Configuration {
     /**
      * {@inheritDoc}
      *
+     * @see org.codelibs.jcifs.smb.Configuration#isFollowSymlinks()
+     */
+    @Override
+    public boolean isFollowSymlinks() {
+        return this.delegate.isFollowSymlinks();
+    }
+
+    /**
+     * {@inheritDoc}
+     *
      * @see org.codelibs.jcifs.smb.Configuration#isDfsConvertToFQDN()
      */
     @Override
@@ -228,6 +237,16 @@ public class DelegatingConfiguration implements Configuration {
     @Override
     public int getMaximumBufferSize() {
         return this.delegate.getMaximumBufferSize();
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @see org.codelibs.jcifs.smb.Configuration#getMaximumTransferSize()
+     */
+    @Override
+    public int getMaximumTransferSize() {
+        return this.delegate.getMaximumTransferSize();
     }
 
     /**
@@ -633,11 +652,31 @@ public class DelegatingConfiguration implements Configuration {
     /**
      * {@inheritDoc}
      *
+     * @see org.codelibs.jcifs.smb.Configuration#isCompressionEnabled()
+     */
+    @Override
+    public boolean isCompressionEnabled() {
+        return this.delegate.isCompressionEnabled();
+    }
+
+    /**
+     * {@inheritDoc}
+     *
      * @see org.codelibs.jcifs.smb.Configuration#getEncryptionCiphers()
      */
     @Override
     public int[] getEncryptionCiphers() {
         return this.delegate.getEncryptionCiphers();
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @see org.codelibs.jcifs.smb.Configuration#getSigningAlgorithms()
+     */
+    @Override
+    public int[] getSigningAlgorithms() {
+        return this.delegate.getSigningAlgorithms();
     }
 
     /**

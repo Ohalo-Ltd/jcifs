@@ -16,8 +16,7 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 /*
- * Modified by Ohalo Ltd on 2026-08-17: declare the encryptionRequired and encryptionCiphers
- * properties.
+ * Modified by Ohalo Ltd on 2026-10-01: declare the jcifs.client.encryptionRequired property.
  */
 package org.codelibs.jcifs.smb;
 
@@ -47,7 +46,7 @@ public interface Configuration {
     /**
      *
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.dfs.ttl} (int, default 300)
+     * Property {@code jcifs.client.dfs.ttl} (int, default 300)
      *
      * @return title to live, in seconds, for DFS cache entries
      */
@@ -55,7 +54,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.dfs.strictView} (boolean, default false)
+     * Property {@code jcifs.client.dfs.strictView} (boolean, default false)
      *
      * @return whether a authentication failure during DFS resolving will throw an exception
      */
@@ -63,11 +62,33 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.dfs.disabled} (boolean, default false)
+     * Property {@code jcifs.client.dfs.disabled} (boolean, default false)
      *
      * @return whether DFS lookup is disabled
      */
     boolean isDfsDisabled();
+
+    /**
+     *
+     * Property {@code jcifs.client.followSymlinks} (boolean, default false)
+     *
+     * <p>
+     * A server that will not follow a symbolic link on the client's behalf answers
+     * STATUS_STOPPED_ON_SYMLINK and names the target instead. With this off, which is the default,
+     * that is raised as an {@link org.codelibs.jcifs.smb.impl.SmbSymlinkException} carrying the
+     * target, and nothing is retried. With it on, a target that is relative to the directory holding
+     * the link is resolved and the request reissued against it.
+     * </p>
+     *
+     * <p>
+     * An absolute target is never followed, whichever way this is set. It is expressed in the
+     * server's own namespace - a Windows server sends forms such as {@code \??\C:\...} - which names
+     * a path this share cannot address, so there is nothing for the client to retry against.
+     * </p>
+     *
+     * @return whether symbolic links are followed
+     */
+    boolean isFollowSymlinks();
 
     /**
      * Enable hack to make kerberos auth work with DFS sending short names
@@ -75,7 +96,7 @@ public interface Configuration {
      * This works by appending the domain name to the netbios short name and will fail horribly if this mapping is not
      * correct for your domain.
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.dfs.convertToFQDN} (boolean, default false)
+     * Property {@code jcifs.client.dfs.convertToFQDN} (boolean, default false)
      *
      * @return whether to convert NetBIOS names returned by DFS to FQDNs
      */
@@ -87,7 +108,10 @@ public interface Configuration {
      * When true, preserve the original case of share names instead of converting to uppercase.
      * This is required for DFS namespaces with case-sensitive link names.
      *
-     * Property {@code jcifs.smb.client.preserveShareCase} (boolean, default false)
+     * Property {@code jcifs.client.preserveShareCase} (boolean, default false)
+     *
+     * The 3.0.1 spelling {@code jcifs.smb.client.preserveShareCase} is still honoured
+     * but deprecated.
      *
      * @return whether to preserve share name case
      */
@@ -96,7 +120,7 @@ public interface Configuration {
     /**
      * Minimum protocol version
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.minVersion} (string, default SMB1)
+     * Property {@code jcifs.client.minVersion} (string, default SMB1)
      *
      * @see DialectVersion
      * @return minimum protocol version to use/allow
@@ -107,7 +131,7 @@ public interface Configuration {
     /**
      * Maximum protocol version
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.maxVersion} (string, default SMB210)
+     * Property {@code jcifs.client.maxVersion} (string, default SMB210)
      *
      * @see DialectVersion
      * @return maximum protocol version to use/allow
@@ -118,7 +142,7 @@ public interface Configuration {
     /**
      * Use SMB2 non-backward compatible negotiation style
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.useSMB2Negotiation} (boolean, default false)
+     * Property {@code jcifs.client.useSMB2Negotiation} (boolean, default false)
      *
      * @return whether to use non-backward compatible protocol negotiation
      */
@@ -127,7 +151,7 @@ public interface Configuration {
     /**
      * Enforce secure negotiation
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.requireSecureNegotiate} (boolean, default true)
+     * Property {@code jcifs.client.requireSecureNegotiate} (boolean, default true)
      *
      * This does not provide any actual downgrade protection if SMB1 is allowed.
      *
@@ -140,7 +164,7 @@ public interface Configuration {
     /**
      * Enable port 139 failover
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.port139.enabled} (boolean, default false)
+     * Property {@code jcifs.client.port139.enabled} (boolean, default false)
      *
      * @return whether to failover to legacy transport on port 139
      */
@@ -148,7 +172,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.useUnicode} (boolean, default true)
+     * Property {@code jcifs.client.useUnicode} (boolean, default true)
      *
      * @return whether to announce support for unicode
      */
@@ -156,7 +180,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.forceUnicode} (boolean, default false)
+     * Property {@code jcifs.client.forceUnicode} (boolean, default false)
      *
      * @return whether to use unicode, even if the server does not announce it
      */
@@ -164,7 +188,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.useBatching} (boolean, default false)
+     * Property {@code jcifs.client.useBatching} (boolean, default false)
      *
      * @return whether to enable support for SMB1 AndX command batching
      */
@@ -172,7 +196,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.nativeOs} (string, default {@code os.name})
+     * Property {@code jcifs.client.nativeOs} (string, default {@code os.name})
      *
      * @return OS string to report
      */
@@ -180,7 +204,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.nativeLanMan} (string, default {@code jCIFS})
+     * Property {@code jcifs.client.nativeLanMan} (string, default {@code jCIFS})
      *
      * @return Lanman string to report
      */
@@ -188,7 +212,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.rcv_buf_size} (int, default 65535)
+     * Property {@code jcifs.client.rcv_buf_size} (int, default 65535)
      *
      * @return receive buffer size, in bytes
      * @deprecated use getReceiveBufferSize instead
@@ -198,7 +222,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.rcv_buf_size} (int, default 65535)
+     * Property {@code jcifs.client.rcv_buf_size} (int, default 65535)
      *
      * @return receive buffer size, in bytes
      */
@@ -206,7 +230,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.snd_buf_size} (int, default 65535)
+     * Property {@code jcifs.client.snd_buf_size} (int, default 65535)
      *
      * @return send buffer size, in bytes
      */
@@ -214,7 +238,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.soTimeout} (int, default 35000)
+     * Property {@code jcifs.client.soTimeout} (int, default 35000)
      *
      * @return socket timeout, in milliseconds
      */
@@ -222,14 +246,14 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.connTimeout} (int, default 35000)
+     * Property {@code jcifs.client.connTimeout} (int, default 35000)
      *
      * @return timeout for establishing a socket connection, in milliseconds
      */
     int getConnTimeout();
 
     /**
-     * Property {@code org.codelibs.jcifs.smb.impl.client.sessionTimeout} (int, default 35000)
+     * Property {@code jcifs.client.sessionTimeout} (int, default 35000)
      *
      *
      * @return timeout for SMB sessions, in milliseconds
@@ -238,7 +262,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.responseTimeout} (int, default 30000)
+     * Property {@code jcifs.client.responseTimeout} (int, default 30000)
      *
      * @return timeout for SMB responses, in milliseconds
      */
@@ -246,7 +270,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.lport} (int)
+     * Property {@code jcifs.client.lport} (int)
      *
      * @return local port to use for outgoing connections
      */
@@ -254,7 +278,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.laddr} (string)
+     * Property {@code jcifs.client.laddr} (string)
      *
      * @return local address to use for outgoing connections
      */
@@ -270,7 +294,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.logonShare}
+     * Property {@code jcifs.client.logonShare}
      *
      * @return share to connect to during authentication, if unset connect to IPC$
      */
@@ -279,7 +303,7 @@ public interface Configuration {
     /**
      *
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.domain}
+     * Property {@code jcifs.client.domain}
      *
      * @return default credentials, domain name
      */
@@ -287,7 +311,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.username}
+     * Property {@code jcifs.client.username}
      *
      * @return default credentials, user name
      */
@@ -295,7 +319,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.password}
+     * Property {@code jcifs.client.password}
      *
      * @return default credentials, password
      */
@@ -324,7 +348,7 @@ public interface Configuration {
      * </table>
      *
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.lmCompatibility} (int, default 3)
+     * Property {@code jcifs.lmCompatibility} (int, default 3)
      *
      * @return lanman compatibility level, defaults to 3 i.e. NTLMv2 only
      */
@@ -332,14 +356,14 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.allowNTLMFallback} (boolean, default true)
+     * Property {@code jcifs.allowNTLMFallback} (boolean, default true)
      *
      * @return whether to allow fallback from kerberos to NTLM
      */
     boolean isAllowNTLMFallback();
 
     /**
-     * Property {@code org.codelibs.jcifs.smb.impl.useRawNTLM} (boolean, default false)
+     * Property {@code jcifs.useRawNTLM} (boolean, default false)
      *
      * @return whether to use raw NTLMSSP tokens instead of SPNEGO wrapped ones
      * @since 2.1
@@ -348,7 +372,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.disablePlainTextPasswords} (boolean, default true)
+     * Property {@code jcifs.client.disablePlainTextPasswords} (boolean, default true)
      *
      * @return whether the usage of plaintext passwords is prohibited, defaults to false
      */
@@ -414,7 +438,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.capabilities} (int)
+     * Property {@code jcifs.client.capabilities} (int)
      *
      * @return custom capabilities
      */
@@ -423,7 +447,7 @@ public interface Configuration {
     /**
      *
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.flags2} (int)
+     * Property {@code jcifs.client.flags2} (int)
      *
      * @return custom flags2
      */
@@ -431,7 +455,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.ssnLimit} (int, 250)
+     * Property {@code jcifs.client.ssnLimit} (int, 250)
      *
      * @return maximum number of sessions on a single connection
      */
@@ -461,7 +485,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.maxMpxCount} (int, default 10)
+     * Property {@code jcifs.client.maxMpxCount} (int, default 10)
      *
      * @return maximum count of concurrent commands to announce
      */
@@ -469,7 +493,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.signingPreferred} (boolean, default false)
+     * Property {@code jcifs.client.signingPreferred} (boolean, default false)
      *
      * @return whether to enable SMB signing (for everything), if available
      */
@@ -477,7 +501,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.ipcSigningEnforced} (boolean, default true)
+     * Property {@code jcifs.client.ipcSigningEnforced} (boolean, default true)
      *
      * @return whether to enforce SMB signing for IPC connections
      */
@@ -485,17 +509,18 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.signingEnforced} (boolean, default false)
+     * Property {@code jcifs.client.signingEnforced} (boolean, default false)
      *
      * @return whether to enforce SMB signing (for everything)
      */
     boolean isSigningEnforced();
 
     /**
-     * Property {@code org.codelibs.jcifs.smb.impl.client.encryptionEnabled} (boolean, default false)
+     * Property {@code jcifs.client.encryptionEnabled} (boolean, default false)
      *
-     * This is an experimental option allowing to indicate support during protocol
-     * negotiation, SMB encryption is not implemented yet.
+     * Enables SMB3 encryption. When enabled the client advertises the ciphers given by
+     * {@link #getEncryptionCiphers()} during protocol negotiation and encrypts traffic on any session or share for
+     * which the server requires it.
      *
      * @return whether SMB encryption is enabled
      * @since 2.1
@@ -503,33 +528,82 @@ public interface Configuration {
     boolean isEncryptionEnabled();
 
     /**
-     * Property {@code org.codelibs.jcifs.smb.impl.client.encryptionRequired} (boolean, default false)
+     * Property {@code jcifs.client.encryptionRequired} (boolean, default false)
      *
-     * Demand SMB3 channel encryption for all connections: sessions on servers
-     * that cannot or will not encrypt fail with a clear error instead of
-     * falling back to a cleartext conversation. Implies advertising encryption
-     * support during negotiation.
+     * Demands SMB3 encryption for every session: a session on a server that cannot or will not encrypt fails with a
+     * clear error instead of falling back to a cleartext conversation. Implies {@link #isEncryptionEnabled()} for
+     * negotiation, and treats every session as if the server had set SMB2_SESSION_FLAG_ENCRYPT_DATA.
      *
      * @return whether SMB encryption is required
      */
     boolean isEncryptionRequired();
 
     /**
-     * Property {@code org.codelibs.jcifs.smb.impl.client.encryptionCiphers} (comma-separated
-     * cipher names, default {@code AES-256-GCM,AES-128-GCM,AES-256-CCM,AES-128-CCM})
+     * Property {@code jcifs.client.compressionEnabled} (boolean, default false)
      *
-     * The encryption ciphers offered in SMB 3.1.1 negotiation, most preferred
-     * first. Narrow the list to restrict connections to specific ciphers,
-     * e.g. {@code AES-256-GCM} only. SMB 3.0.x supports only AES-128-CCM;
-     * removing it from this list disables encryption for those dialects.
+     * Enables SMB 3.1.1 compression. When enabled the client offers the compression algorithms it is able to
+     * decompress during protocol negotiation, and asks the server to compress the data it reads back. Nothing
+     * this client sends is compressed: a client is never obliged to compress, and a server does not require it.
      *
-     * @return MS-SMB2 encryption cipher identifiers in preference order
+     * <p>
+     * Which algorithms are offered is deliberately not configurable, unlike {@link #getEncryptionCiphers()}.
+     * MS-SMB2 3.2.5.2 requires the connection to fail when a server names an algorithm the client did not
+     * offer, so the offer states what this client can actually read rather than what it would prefer - and a
+     * settable list would let a caller promise something it cannot honour.
+     * </p>
+     *
+     * <p>
+     * Has no effect below SMB 3.1.1, which has no negotiate context to carry the offer.
+     * </p>
+     *
+     * @return whether SMB3 compression is enabled
+     */
+    boolean isCompressionEnabled();
+
+    /**
+     * Property {@code jcifs.client.encryptionCiphers} (comma-separated, default
+     * {@code AES-128-GCM, AES-128-CCM, AES-256-GCM, AES-256-CCM})
+     *
+     * The SMB 3.1.1 encryption ciphers to offer, in order of preference. Recognised names are
+     * {@code AES-128-CCM}, {@code AES-128-GCM}, {@code AES-256-CCM} and {@code AES-256-GCM}; an unrecognised name
+     * is an error rather than being ignored. Only consulted when {@link #isEncryptionEnabled()} is set, and only
+     * on SMB 3.1.1, which is the only dialect that negotiates a cipher in a negotiate context - SMB 3.0 and 3.0.2
+     * always use AES-128-CCM.
+     *
+     * <p>
+     * Note that this states a preference rather than a requirement. The server picks one cipher from the offered
+     * list and is free to apply its own order of preference when doing so, so listing AES-256 first does not
+     * guarantee AES-256 is what gets negotiated. Offering only the AES-256 ciphers does require them, at the cost
+     * of failing against a server that does not implement them.
+     * </p>
+     *
+     * @return the encryption cipher identifiers to offer, in preference order
      */
     int[] getEncryptionCiphers();
 
     /**
+     * Property {@code jcifs.client.signingAlgorithms} (comma-separated, default
+     * {@code AES-CMAC, AES-GMAC, HMAC-SHA256})
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.forceExtendedSecurity} (boolean, default false)
+     * The SMB 3.1.1 signing algorithms to offer, in order of preference. Recognised names are
+     * {@code HMAC-SHA256}, {@code AES-CMAC} and {@code AES-GMAC}; an unrecognised name is an error rather than
+     * being ignored. Only consulted on SMB 3.1.1, which is the only dialect that negotiates a signing algorithm
+     * in a negotiate context - SMB 3.0 and 3.0.2 always sign with AES-128-CMAC and SMB 2.x with HMAC-SHA256.
+     *
+     * <p>
+     * As with the encryption ciphers, this states a preference rather than a requirement: the server picks one
+     * algorithm from the offered list and may apply its own order when doing so. The default leads with AES-CMAC,
+     * which is what the client has always used, so the algorithm negotiated against a given server does not
+     * change unless this property does.
+     * </p>
+     *
+     * @return the signing algorithm identifiers to offer, in preference order
+     */
+    int[] getSigningAlgorithms();
+
+    /**
+     *
+     * Property {@code jcifs.client.forceExtendedSecurity} (boolean, default false)
      *
      * @return whether to force extended security usage
      */
@@ -601,8 +675,23 @@ public interface Configuration {
     int getMaximumBufferSize();
 
     /**
+     * The largest payload a single SMB2 read or write may carry.
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.transaction_buf_size} (int, default 65535)
+     * <p>
+     * Property {@code jcifs.client.maxTransferSize} (int, default 1048576). The negotiated size is the smaller of
+     * this and what the server offers. Anything above 64 KiB needs multi-credit, which the client only gets on
+     * SMB 2.1 and later; below that the server's own offer keeps the transfer at 64 KiB regardless of this value.
+     * This governs SMB2 only - {@code jcifs.client.rcv_buf_size} and {@code jcifs.client.snd_buf_size} still govern
+     * SMB1, whose receive path cannot carry more than 64 KiB.
+     * </p>
+     *
+     * @return maximum size of a single SMB2 read or write, in bytes
+     */
+    int getMaximumTransferSize();
+
+    /**
+     *
+     * Property {@code jcifs.client.transaction_buf_size} (int, default 65535)
      *
      * @return maximum data size for SMB transactions
      */
@@ -610,7 +699,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.maxBuffers} (int, default 16)
+     * Property {@code jcifs.maxBuffers} (int, default 16)
      *
      * @return number of buffers to keep in cache
      */
@@ -618,7 +707,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.listCount} (int, default 200)
+     * Property {@code jcifs.client.listCount} (int, default 200)
      *
      * @return maxmimum number of elements to request in a list request
      */
@@ -626,7 +715,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.listSize} (int, default 65435)
+     * Property {@code jcifs.client.listSize} (int, default 65435)
      *
      * @return maximum data size for list/info requests (known overhead is subtracted)
      */
@@ -635,7 +724,7 @@ public interface Configuration {
     /**
      *
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.attrExpirationPeriod} (int, 5000)
+     * Property {@code jcifs.client.attrExpirationPeriod} (int, 5000)
      *
      * @return timeout of file attribute cache
      */
@@ -644,7 +733,7 @@ public interface Configuration {
     /**
      *
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.ignoreCopyToException} (boolean, false)
+     * Property {@code jcifs.client.ignoreCopyToException} (boolean, false)
      *
      * @return whether to ignore exceptions that occur during file copy
      */
@@ -660,7 +749,7 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.notify_buf_size} (int, default 1024)
+     * Property {@code jcifs.client.notify_buf_size} (int, default 1024)
      *
      * @return the size of the requested server notify buffer
      */
@@ -669,14 +758,14 @@ public interface Configuration {
     /**
      *
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.maxRequestRetries} (int, default 2)
+     * Property {@code jcifs.client.maxRequestRetries} (int, default 2)
      *
      * @return retry SMB requests on failure up to n times
      */
     int getMaxRequestRetries();
 
     /**
-     * Property {@code org.codelibs.jcifs.smb.impl.client.strictResourceLifecycle} (bool, default false)
+     * Property {@code jcifs.client.strictResourceLifecycle} (bool, default false)
      *
      * If enabled, SmbFile instances starting with their first use will hold a reference to their tree.
      * This means that trees/sessions/connections won't be idle-disconnected even if there are no other active
@@ -718,7 +807,7 @@ public interface Configuration {
     /**
      *
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.disableSpnegoIntegrity} (boolean, false)
+     * Property {@code jcifs.client.disableSpnegoIntegrity} (boolean, false)
      *
      * @return whether to disable sending/verifying SPNEGO mechanismListMIC
      */
@@ -726,35 +815,35 @@ public interface Configuration {
 
     /**
      *
-     * Property {@code org.codelibs.jcifs.smb.impl.client.enforceSpnegoIntegrity} (boolean, false)
+     * Property {@code jcifs.client.enforceSpnegoIntegrity} (boolean, false)
      *
      * @return whether to enforce verifying SPNEGO mechanismListMIC
      */
     boolean isEnforceSpnegoIntegrity();
 
     /**
-     * Property {@code org.codelibs.jcifs.smb.impl.client.SendNTLMTargetName} (boolean, true)
+     * Property {@code jcifs.client.SendNTLMTargetName} (boolean, true)
      *
      * @return whether to send an AvTargetName with the NTLM exchange
      */
     boolean isSendNTLMTargetName();
 
     /**
-     * Property {@code org.codelibs.jcifs.smb.impl.client.guestPassword}, defaults to empty string
+     * Property {@code jcifs.client.guestPassword}, defaults to empty string
      *
      * @return password used when guest authentication is requested
      */
     String getGuestPassword();
 
     /**
-     * Property {@code org.codelibs.jcifs.smb.impl.client.guestUsername}, defaults to GUEST
+     * Property {@code jcifs.client.guestUsername}, defaults to GUEST
      *
      * @return username used when guest authentication is requested
      */
     String getGuestUsername();
 
     /**
-     * Property {@code org.codelibs.jcifs.smb.impl.client.allowGuestFallback}, defaults to false
+     * Property {@code jcifs.client.allowGuestFallback}, defaults to false
      *
      * @return whether to permit guest logins when user authentication is requested
      */

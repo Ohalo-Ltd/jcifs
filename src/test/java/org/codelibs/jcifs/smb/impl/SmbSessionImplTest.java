@@ -1,7 +1,3 @@
-/*
- * Modified by Ohalo Ltd on 2026-08-17: cover deriving the encryption context from the session key.
- */
-
 package org.codelibs.jcifs.smb.impl;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -11,12 +7,12 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
@@ -33,6 +29,7 @@ import org.codelibs.jcifs.smb.Credentials;
 import org.codelibs.jcifs.smb.RuntimeCIFSException;
 import org.codelibs.jcifs.smb.internal.SMBSigningDigest;
 import org.codelibs.jcifs.smb.internal.smb2.Smb2EncryptionContext;
+import org.codelibs.jcifs.smb.internal.smb2.create.Smb2CreateRequest;
 import org.codelibs.jcifs.smb.internal.smb2.session.Smb2SessionSetupResponse;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -313,61 +310,19 @@ class SmbSessionImplTest {
     }
 
     @Test
-    @DisplayName("encryption context resolution honours session- and share-level requirements")
-    void testEncryptionContextResolution() throws Exception {
-        SmbSessionImpl session = newSession();
-        Smb2EncryptionContext enc = mock(Smb2EncryptionContext.class);
-
-        // no context -> nothing to encrypt with
-        assertNull(session.getEncryptionContextFor(1));
-
-        // a context alone does not force encryption - a requirement must exist
-        setField(session, "encryptionContext", enc);
-        assertNull(session.getEncryptionContextFor(1));
-
-        // session-level requirement (SMB2_SESSION_FLAG_ENCRYPT_DATA) covers every tree
-        setField(session, "encryptData", true);
-        assertSame(enc, session.getEncryptionContextFor(1));
-        assertSame(enc, session.getEncryptionContextFor(99));
-
-        // share-level requirement (SMB2_SHAREFLAG_ENCRYPT_DATA) covers only that tree
-        setField(session, "encryptData", false);
-        session.addEncryptedTree(7);
-        assertSame(enc, session.getEncryptionContextFor(7));
-        assertNull(session.getEncryptionContextFor(8), "Other trees stay in cleartext");
-
-        session.removeEncryptedTree(7);
-        assertNull(session.getEncryptionContextFor(7), "Disconnected trees no longer require encryption");
-    }
-
-    @Test
-    @DisplayName("encryption: flags, encryption, and decryption delegation")
-    void testEncryptionDelegation() throws Exception {
+    @DisplayName("encryption: context is exposed to the transport once it exists")
+    void testEncryptionContextExposure() throws Exception {
         SmbSessionImpl session = newSession();
 
-        // No encryption context -> throws
-        CIFSException notEnabled = assertThrows(CIFSException.class, () -> session.encryptMessage(new byte[] { 1 }));
-        assertTrue(notEnabled.getMessage().contains("Encryption not enabled"));
-        assertThrows(CIFSException.class, () -> session.decryptMessage(new byte[] { 1 }));
+        // No encryption context -> the transport must not try to encrypt on this session
+        assertFalse(session.isEncryptionEnabled());
+        assertNull(session.getEncryptionContext());
 
-        // Set encryption context and verify delegation
         Smb2EncryptionContext enc = mock(Smb2EncryptionContext.class);
         setField(session, "encryptionContext", enc);
-        setField(session, "sessionId", 99L);
-
-        when(enc.encryptMessage(any(byte[].class), eq(99L))).thenReturn(new byte[] { 9, 9 });
-        when(enc.decryptMessage(any(byte[].class))).thenReturn(new byte[] { 7, 7 });
 
         assertTrue(session.isEncryptionEnabled());
         assertSame(enc, session.getEncryptionContext());
-
-        byte[] encOut = session.encryptMessage(new byte[] { 1, 2, 3 });
-        assertArrayEquals(new byte[] { 9, 9 }, encOut);
-        verify(enc, times(1)).encryptMessage(eq(new byte[] { 1, 2, 3 }), eq(99L));
-
-        byte[] decOut = session.decryptMessage(new byte[] { 5 });
-        assertArrayEquals(new byte[] { 7, 7 }, decOut);
-        verify(enc, times(1)).decryptMessage(eq(new byte[] { 5 }));
     }
 
     @Test
@@ -413,5 +368,121 @@ class SmbSessionImplTest {
         // Cause the inner reauthenticate to fail at first transport call
         when(transport.getNegotiateResponse()).thenThrow(new SmbException("fail"));
         assertThrows(CIFSException.class, session::reauthenticate);
+    }
+
+    /**
+     * An oplock break names only the file it breaks. MS-SMB2 3.2.5.19.1 has the client find the open in
+     * Session.OpenTable by that file id, because the acknowledgement has to carry the session and tree of the open -
+     * the notification's own header carries TreeId 0 and, on several servers, SessionId 0.
+     */
+    @Test
+    @DisplayName("an open is found by its file id once registered")
+    void testOpenTableLookup() {
+        SmbSessionImpl session = newSession();
+        byte[] fileId = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+        SmbFileHandleImpl handle = mock(SmbFileHandleImpl.class);
+
+        assertNull(session.getOpen(fileId), "nothing is registered yet");
+
+        session.registerOpen(fileId, handle);
+
+        assertSame(handle, session.getOpen(fileId));
+        assertSame(handle, session.getOpen(fileId.clone()), "lookup is by contents, not identity");
+    }
+
+    @Test
+    @DisplayName("an open is gone from the table once unregistered")
+    void testOpenTableUnregister() {
+        SmbSessionImpl session = newSession();
+        byte[] fileId = new byte[] { 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1 };
+        SmbFileHandleImpl handle = mock(SmbFileHandleImpl.class);
+        session.registerOpen(fileId, handle);
+
+        session.unregisterOpen(fileId);
+
+        assertNull(session.getOpen(fileId), "a closed open must not be left behind");
+    }
+
+    @Test
+    @DisplayName("an unknown file id resolves to nothing rather than failing")
+    void testOpenTableMiss() {
+        SmbSessionImpl session = newSession();
+        session.registerOpen(new byte[16], mock(SmbFileHandleImpl.class));
+
+        // 3.2.5.19.1: a break naming no open of ours is ignored, so a miss must be quiet
+        assertNull(session.getOpen(new byte[] { 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9 }));
+        assertNull(session.getOpen(null));
+    }
+
+    @Test
+    @DisplayName("the session id is readable for the break acknowledgement header")
+    void testSessionIdAccessor() throws Exception {
+        SmbSessionImpl session = newSession();
+        assertEquals(0L, session.getSessionId(), "a session that has not authenticated has no id yet");
+
+        setField(session, "sessionId", 0x4142434445464748L);
+
+        assertEquals(0x4142434445464748L, session.getSessionId());
+    }
+
+    private SmbTreeHandleImpl stubbedTree() {
+        SmbTreeHandleImpl tree = mock(SmbTreeHandleImpl.class);
+        lenient().when(tree.acquire()).thenReturn(tree);
+        lenient().when(tree.getTreeId()).thenReturn(7L);
+        lenient().when(tree.isConnected()).thenReturn(true);
+        lenient().when(tree.isSMB2()).thenReturn(true);
+        return tree;
+    }
+
+    @Test
+    @DisplayName("an open registers itself with its session and is found by file id")
+    void testHandleRegistersWithSession() {
+        SmbSessionImpl session = newSession();
+        byte[] fileId = new byte[] { 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32 };
+        SmbFileHandleImpl handle = new SmbFileHandleImpl(configuration, fileId, stubbedTree(), "//server/share/f", 0, 0, 0, 0, 0L);
+
+        assertNull(session.getOpen(fileId), "an unattached handle is not in the table");
+
+        handle.registerWith(session, Smb2CreateRequest.SMB2_OPLOCK_LEVEL_BATCH);
+
+        assertSame(handle, session.getOpen(fileId));
+    }
+
+    @Test
+    @DisplayName("closing an open takes it out of the session's table")
+    void testHandleUnregistersOnClose() throws Exception {
+        SmbSessionImpl session = newSession();
+        byte[] fileId = new byte[] { 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 4, 7, 11, 18, 29 };
+        SmbFileHandleImpl handle = new SmbFileHandleImpl(configuration, fileId, stubbedTree(), "//server/share/f", 0, 0, 0, 0, 0L);
+        handle.registerWith(session, Smb2CreateRequest.SMB2_OPLOCK_LEVEL_BATCH);
+
+        handle.close();
+
+        assertNull(session.getOpen(fileId), "a closed open must not be left in the table");
+    }
+
+    @Test
+    @DisplayName("an open marked closed without a close request is also taken out of the table")
+    void testHandleUnregistersOnMarkClosed() {
+        SmbSessionImpl session = newSession();
+        byte[] fileId = new byte[] { 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 39, 42, 45, 48 };
+        SmbFileHandleImpl handle = new SmbFileHandleImpl(configuration, fileId, stubbedTree(), "//server/share/f", 0, 0, 0, 0, 0L);
+        handle.registerWith(session, Smb2CreateRequest.SMB2_OPLOCK_LEVEL_BATCH);
+
+        // A handle invalidated without a close request - a reconnect drops it - must not be left behind either,
+        // or the table pins it for the life of the session.
+        handle.markClosed();
+
+        assertNull(session.getOpen(fileId), "an invalidated open must not be left in the table");
+    }
+
+    @Test
+    @DisplayName("an open that was never attached to a session closes without failing")
+    void testUnattachedHandleCloses() throws Exception {
+        // Every existing caller builds handles without a session, and SMB1 handles have no file id at all.
+        SmbFileHandleImpl handle = new SmbFileHandleImpl(configuration, 42, stubbedTree(), "//server/share/f", 0, 0, 0, 0, 0L);
+
+        handle.close();
+        handle.markClosed();
     }
 }

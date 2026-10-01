@@ -1,0 +1,1296 @@
+/*
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+ */
+package org.codelibs.jcifs.smb.it;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Properties;
+
+import org.codelibs.jcifs.smb.CIFSContext;
+import org.codelibs.jcifs.smb.CIFSException;
+import org.codelibs.jcifs.smb.SmbConstants;
+import org.codelibs.jcifs.smb.SmbResource;
+import org.codelibs.jcifs.smb.impl.NtStatus;
+import org.codelibs.jcifs.smb.impl.NtlmPasswordAuthenticator;
+import org.codelibs.jcifs.smb.impl.SmbException;
+import org.codelibs.jcifs.smb.impl.SmbFile;
+import org.codelibs.jcifs.smb.impl.SmbRandomAccessFile;
+import org.codelibs.jcifs.smb.it.env.RequiresBackend;
+import org.codelibs.jcifs.smb.it.env.SmbBackend;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * File operations against a real SMB server.
+ *
+ * <p>
+ * These tests predate the harness and used to start their own Samba container.
+ * They now go through {@link AbstractSmbIT}, so the same bodies run against
+ * either backend.
+ * </p>
+ */
+class SmbFileIT extends AbstractSmbIT {
+
+    private static final Logger log = LoggerFactory.getLogger(SmbFileIT.class);
+
+    private static final String TESTUSER1 = "testuser1";
+    private static final String TESTUSER2 = "testuser2";
+
+    /**
+     * Creates a CIFSContext for the specified user.
+     *
+     * @param username the username
+     * @param password the password
+     * @return a configured CIFSContext
+     */
+    private static CIFSContext createContext(final String username, final String password) {
+        try {
+            return server().context(username, password);
+        } catch (final CIFSException e) {
+            throw new RuntimeException("Failed to create CIFS context", e);
+        }
+    }
+
+    /**
+     * Creates an SMB URL for the specified share and path.
+     *
+     * @param share the share name
+     * @param path  the path within the share
+     * @return the SMB URL
+     */
+    private String createSmbUrl(final String share, final String path) {
+        return server().url(share, path);
+    }
+
+    @AfterEach
+    void cleanup() throws Exception {
+        // Clean up test files after each test
+        final CIFSContext context = createContext(TESTUSER1, password());
+        cleanupShare(context, "users");
+        cleanupShare(context, "testuser1private");
+
+        final CIFSContext context2 = createContext(TESTUSER2, password());
+        cleanupShare(context2, "testuser2private");
+    }
+
+    private static String password() {
+        return server().password();
+    }
+
+    private void cleanupShare(final CIFSContext context, final String share) {
+        try {
+            final SmbFile shareRoot = new SmbFile(server().url(share), context);
+            if (shareRoot.exists()) {
+                deleteRecursively(shareRoot);
+            }
+        } catch (final Exception e) {
+            log.warn("Failed to cleanup share: {}", share, e);
+        }
+    }
+
+    private void deleteRecursively(final SmbFile file) throws Exception {
+        if (file.isDirectory()) {
+            final SmbResource[] children = file.listFiles();
+            if (children != null) {
+                for (final SmbResource child : children) {
+                    deleteRecursively((SmbFile) child);
+                }
+            }
+        }
+        if (file.exists()) {
+            file.delete();
+        }
+    }
+
+    /**
+     * Tests for connection and authentication.
+     */
+    @Nested
+    class ConnectionAndAuthenticationTests {
+
+        @Test
+        void testConnectWithValidCredentials() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final String url = createSmbUrl("users", "");
+            final SmbFile file = new SmbFile(url, context);
+
+            assertTrue(file.exists(), "Should be able to connect to users share with valid credentials");
+        }
+
+        @Test
+        @RequiresBackend(SmbBackend.SAMBA)
+        // Windows Server 2025 and Windows 11 24H2 refuse insecure guest access by
+        // default, and the Windows fixture does not re-enable it.
+        void testConnectToPublicShare() throws Exception {
+            final CIFSContext context = createContext(null, null);
+            final String url = createSmbUrl("public", "");
+            final SmbFile file = new SmbFile(url, context);
+
+            assertTrue(file.exists(), "Should be able to connect to public share without credentials");
+        }
+
+        @Test
+        @RequiresBackend(SmbBackend.SAMBA)
+        // Samba refuses the tree connect, and exists() rethrows anything that is
+        // not a "not found" status. Windows accepts the tree connect and refuses at
+        // open instead - see
+        // AuthenticationIT.inaccessibleShareStillReportsThatItExists.
+        void testAccessDeniedToPrivateShare() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final String url = createSmbUrl("testuser2private", "");
+
+            // testuser1 should not be able to access testuser2's private share
+            assertThrows(Exception.class, () -> {
+                final SmbFile file = new SmbFile(url, context);
+                file.exists();
+            }, "Should not be able to access another user's private share");
+        }
+
+        @Test
+        void testConnectToOwnPrivateShare() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final String url = createSmbUrl("testuser1private", "");
+            final SmbFile file = new SmbFile(url, context);
+
+            assertTrue(file.exists(), "Should be able to access own private share");
+        }
+    }
+
+    /**
+     * Tests for file creation, deletion, and basic operations.
+     */
+    @Nested
+    class FileOperationsTests {
+
+        @Test
+        void testCreateAndDeleteTextFile() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final String url = createSmbUrl("users", "test.txt");
+            final SmbFile file = new SmbFile(url, context);
+
+            // Create file
+            file.createNewFile();
+            assertTrue(file.exists(), "File should exist after creation");
+
+            // Delete file
+            file.delete();
+            assertFalse(file.exists(), "File should not exist after deletion");
+        }
+
+        @Test
+        void testWriteAndReadTextFile() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final String url = createSmbUrl("users", "test.txt");
+            final SmbFile file = new SmbFile(url, context);
+
+            final String content = "Hello, SMB World!";
+
+            // Write to file
+            try (OutputStream os = file.getOutputStream()) {
+                os.write(content.getBytes(StandardCharsets.UTF_8));
+            }
+
+            // Read from file
+            try (InputStream is = file.getInputStream()) {
+                final byte[] buffer = new byte[1024];
+                final int bytesRead = is.read(buffer);
+                final String readContent = new String(buffer, 0, bytesRead, StandardCharsets.UTF_8);
+                assertEquals(content, readContent, "Read content should match written content");
+            }
+        }
+
+        @Test
+        void testWriteAndReadBinaryFile() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final String url = createSmbUrl("users", "binary.dat");
+            final SmbFile file = new SmbFile(url, context);
+
+            final byte[] data = new byte[256];
+            for (int i = 0; i < 256; i++) {
+                data[i] = (byte) i;
+            }
+
+            // Write binary data
+            try (OutputStream os = file.getOutputStream()) {
+                os.write(data);
+            }
+
+            // Read binary data
+            try (InputStream is = file.getInputStream()) {
+                final byte[] readData = new byte[256];
+                final int bytesRead = is.read(readData);
+                assertEquals(256, bytesRead, "Should read all bytes");
+                assertArrayEquals(data, readData, "Read data should match written data");
+            }
+        }
+
+        @Test
+        void testOverwriteFile() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final String url = createSmbUrl("users", "overwrite.txt");
+            final SmbFile file = new SmbFile(url, context);
+
+            final String firstContent = "First content";
+            final String secondContent = "Second content";
+
+            // Write initial content
+            try (OutputStream os = file.getOutputStream()) {
+                os.write(firstContent.getBytes(StandardCharsets.UTF_8));
+            }
+
+            // Overwrite with new content
+            try (OutputStream os = file.getOutputStream()) {
+                os.write(secondContent.getBytes(StandardCharsets.UTF_8));
+            }
+
+            // Read content
+            try (InputStream is = file.getInputStream()) {
+                final byte[] buffer = new byte[1024];
+                final int bytesRead = is.read(buffer);
+                final String readContent = new String(buffer, 0, bytesRead, StandardCharsets.UTF_8);
+                assertEquals(secondContent, readContent, "File should contain overwritten content");
+            }
+        }
+
+        @Test
+        void testFileExists() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final String url = createSmbUrl("users", "exists.txt");
+            final SmbFile file = new SmbFile(url, context);
+
+            assertFalse(file.exists(), "File should not exist initially");
+
+            file.createNewFile();
+            assertTrue(file.exists(), "File should exist after creation");
+
+            file.delete();
+            assertFalse(file.exists(), "File should not exist after deletion");
+        }
+
+        @Test
+        void testDeleteNonExistentFile() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final String url = createSmbUrl("users", "nonexistent.txt");
+            final SmbFile file = new SmbFile(url, context);
+
+            assertFalse(file.exists(), "File should not exist initially");
+
+            // delete() decides this itself rather than leaving it to the server: it checks existence first and
+            // raises OBJECT_NAME_NOT_FOUND. Swallowing that hid a guaranteed failure and left the test passing for
+            // any behaviour at all, including a delete that removed some other path.
+            final SmbException e = assertThrows(SmbException.class, file::delete, "deleting a file that does not exist must fail");
+            assertEquals(NtStatus.NT_STATUS_OBJECT_NAME_NOT_FOUND, e.getNtStatus(),
+                    "unexpected status: 0x" + Integer.toHexString(e.getNtStatus()));
+        }
+    }
+
+    /**
+     * Tests for directory operations.
+     */
+    @Nested
+    class DirectoryOperationsTests {
+
+        @Test
+        void testCreateAndDeleteDirectory() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final String url = createSmbUrl("users", "testdir/");
+            final SmbFile dir = new SmbFile(url, context);
+
+            // Create directory
+            dir.mkdir();
+            assertTrue(dir.exists(), "Directory should exist after creation");
+            assertTrue(dir.isDirectory(), "Should be identified as directory");
+
+            // Delete directory
+            dir.delete();
+            assertFalse(dir.exists(), "Directory should not exist after deletion");
+        }
+
+        @Test
+        void testCreateNestedDirectories() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final String url = createSmbUrl("users", "parent/child/grandchild/");
+            final SmbFile dir = new SmbFile(url, context);
+
+            // Create nested directories
+            dir.mkdirs();
+            assertTrue(dir.exists(), "Nested directories should exist after creation");
+            assertTrue(dir.isDirectory(), "Should be identified as directory");
+        }
+
+        @Test
+        void testListDirectory() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final String dirUrl = createSmbUrl("users", "listtest/");
+            final SmbFile dir = new SmbFile(dirUrl, context);
+            dir.mkdir();
+
+            // Create some files
+            new SmbFile(createSmbUrl("users", "listtest/file1.txt"), context).createNewFile();
+            new SmbFile(createSmbUrl("users", "listtest/file2.txt"), context).createNewFile();
+            new SmbFile(createSmbUrl("users", "listtest/subdir/"), context).mkdir();
+
+            // List files
+            final SmbResource[] files = dir.listFiles();
+            assertNotNull(files, "List should not be null");
+            assertEquals(3, files.length, "Should have 3 entries");
+        }
+
+        @Test
+        void testDeleteNonEmptyDirectory() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final String dirUrl = createSmbUrl("users", "nonempty/");
+            final SmbFile dir = new SmbFile(dirUrl, context);
+            dir.mkdir();
+
+            // Create a file inside
+            final SmbFile child = new SmbFile(createSmbUrl("users", "nonempty/file.txt"), context);
+            child.createNewFile();
+
+            // delete() recurses into the directory itself, so it is the API under test here and not a step to be
+            // stood in for. Deleting the contents from the test first, as this used to, meant a delete() whose own
+            // recursion was broken still left an empty directory to remove, and the test passed either way.
+            dir.delete();
+
+            // Asked again through fresh handles, because exists() serves a cached answer for up to
+            // jcifs.client.attrExpirationPeriod (5 s by default) and only the instance that performed the delete
+            // clears its own cache, so a sibling handle can still report a deleted file as present.
+            try (SmbFile childAgain = new SmbFile(createSmbUrl("users", "nonempty/file.txt"), context);
+                    SmbFile dirAgain = new SmbFile(createSmbUrl("users", "nonempty/"), context)) {
+                assertFalse(childAgain.exists(), "delete() should have removed the directory's contents");
+                assertFalse(dirAgain.exists(), "delete() should have removed the directory itself");
+            }
+        }
+    }
+
+    /**
+     * Tests for file attributes.
+     */
+    @Nested
+    class FileAttributeTests {
+
+        @Test
+        void testGetFileSize() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final String url = createSmbUrl("users", "sized.txt");
+            final SmbFile file = new SmbFile(url, context);
+
+            final byte[] data = "0123456789".getBytes(StandardCharsets.UTF_8);
+            try (OutputStream os = file.getOutputStream()) {
+                os.write(data);
+            }
+
+            assertEquals(data.length, file.length(), "File size should match written data length");
+        }
+
+        @Test
+        void testGetLastModified() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final String url = createSmbUrl("users", "timestamped.txt");
+            final SmbFile file = new SmbFile(url, context);
+
+            final long beforeCreate = System.currentTimeMillis();
+            file.createNewFile();
+            final long afterCreate = System.currentTimeMillis();
+
+            final long lastModified = file.lastModified();
+            assertTrue(lastModified >= beforeCreate - 60000 && lastModified <= afterCreate + 60000,
+                    "Last modified time should be around creation time");
+        }
+
+        @Test
+        void testIsFileAndIsDirectory() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+
+            final SmbFile file = new SmbFile(createSmbUrl("users", "testfile.txt"), context);
+            file.createNewFile();
+            assertTrue(file.isFile(), "Should be identified as file");
+            assertFalse(file.isDirectory(), "Should not be identified as directory");
+
+            final SmbFile dir = new SmbFile(createSmbUrl("users", "testdir/"), context);
+            dir.mkdir();
+            assertTrue(dir.isDirectory(), "Should be identified as directory");
+            assertFalse(dir.isFile(), "Should not be identified as file");
+        }
+    }
+
+    /**
+     * Tests for file rename and move operations.
+     */
+    @Nested
+    class FileRenameAndMoveTests {
+
+        @Test
+        void testRenameFileInSameDirectory() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile oldFile = new SmbFile(createSmbUrl("users", "oldname.txt"), context);
+            final SmbFile newFile = new SmbFile(createSmbUrl("users", "newname.txt"), context);
+
+            oldFile.createNewFile();
+            assertTrue(oldFile.exists(), "Old file should exist");
+
+            oldFile.renameTo(newFile);
+            assertFalse(oldFile.exists(), "Old file should not exist after rename");
+            assertTrue(newFile.exists(), "New file should exist after rename");
+        }
+
+        @Test
+        void testMoveFileToSubdirectory() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile sourceFile = new SmbFile(createSmbUrl("users", "source.txt"), context);
+            final SmbFile targetDir = new SmbFile(createSmbUrl("users", "targetdir/"), context);
+            final SmbFile targetFile = new SmbFile(createSmbUrl("users", "targetdir/source.txt"), context);
+
+            sourceFile.createNewFile();
+            targetDir.mkdir();
+
+            sourceFile.renameTo(targetFile);
+            assertFalse(sourceFile.exists(), "Source file should not exist after move");
+            assertTrue(targetFile.exists(), "Target file should exist after move");
+        }
+    }
+
+    /**
+     * Tests for stream operations.
+     */
+    @Nested
+    class StreamOperationsTests {
+
+        @Test
+        void testInputStreamRead() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "stream.txt"), context);
+
+            final String content = "Test stream content";
+            try (OutputStream os = file.getOutputStream()) {
+                os.write(content.getBytes(StandardCharsets.UTF_8));
+            }
+
+            try (InputStream is = file.getInputStream()) {
+                final StringBuilder sb = new StringBuilder();
+                int c;
+                while ((c = is.read()) != -1) {
+                    sb.append((char) c);
+                }
+                assertEquals(content, sb.toString(), "Stream content should match");
+            }
+        }
+
+        @Test
+        void testRandomAccessFile() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "random.txt"), context);
+
+            try (SmbRandomAccessFile raf = new SmbRandomAccessFile(file, "rw")) {
+                raf.write("0123456789".getBytes(StandardCharsets.UTF_8));
+                raf.seek(5);
+                final byte[] buffer = new byte[5];
+                raf.read(buffer);
+                assertEquals("56789", new String(buffer, StandardCharsets.UTF_8), "Should read from seek position");
+            }
+        }
+    }
+
+    /**
+     * Tests for permissions and access control.
+     */
+    @Nested
+    class PermissionTests {
+
+        @Test
+        void testUserCannotAccessOtherPrivateShare() throws Exception {
+            final CIFSContext context1 = createContext(TESTUSER1, password());
+            final String url = createSmbUrl("testuser2private", "file.txt");
+
+            assertThrows(Exception.class, () -> {
+                final SmbFile file = new SmbFile(url, context1);
+                file.createNewFile();
+            }, "testuser1 should not be able to write to testuser2's private share");
+        }
+
+        @Test
+        void testUserCanAccessOwnPrivateShare() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("testuser1private", "private.txt"), context);
+
+            file.createNewFile();
+            assertTrue(file.exists(), "User should be able to create file in own private share");
+        }
+
+        @Test
+        void testBothUsersCanAccessUsersShare() throws Exception {
+            final CIFSContext context1 = createContext(TESTUSER1, password());
+            final CIFSContext context2 = createContext(TESTUSER2, password());
+
+            final SmbFile file1 = new SmbFile(createSmbUrl("users", "user1file.txt"), context1);
+            final SmbFile file2 = new SmbFile(createSmbUrl("users", "user2file.txt"), context2);
+
+            file1.createNewFile();
+            file2.createNewFile();
+
+            assertTrue(file1.exists(), "testuser1 should be able to create file in users share");
+            assertTrue(file2.exists(), "testuser2 should be able to create file in users share");
+
+            // Each user should be able to see the other's file
+            final SmbFile file1AsSeenByUser2 = new SmbFile(createSmbUrl("users", "user1file.txt"), context2);
+            assertTrue(file1AsSeenByUser2.exists(), "testuser2 should be able to see testuser1's file");
+        }
+    }
+
+    /**
+     * Tests for error handling.
+     */
+    @Nested
+    class ErrorHandlingTests {
+
+        @Test
+        void testFileNotFoundException() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "nonexistent.txt"), context);
+
+            assertThrows(IOException.class, () -> {
+                file.getInputStream();
+            }, "Should throw exception when trying to read non-existent file");
+        }
+
+        @Test
+        void testInvalidPath() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+
+            // Creating an SmbFile with invalid host doesn't throw immediately,
+            // but accessing it should
+            assertThrows(Exception.class, () -> {
+                final SmbFile file = new SmbFile("smb://invalid-host-that-does-not-exist-12345/share/file.txt", context);
+                file.exists(); // This will throw when trying to connect
+            }, "Should handle invalid paths gracefully");
+        }
+    }
+
+    /**
+     * Tests for large file operations.
+     */
+    @Nested
+    class LargeFileTests {
+
+        @Test
+        void testLargeFileWriteAndRead() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "large.dat"), context);
+
+            final int size = 10 * 1024 * 1024; // 10MB
+            final byte[] data = new byte[size];
+            for (int i = 0; i < size; i++) {
+                data[i] = (byte) (i % 256);
+            }
+
+            // Write large file
+            try (OutputStream os = file.getOutputStream()) {
+                os.write(data);
+            }
+
+            assertEquals(size, file.length(), "File size should match");
+
+            // Read and verify
+            try (InputStream is = file.getInputStream()) {
+                final byte[] readData = new byte[size];
+                int offset = 0;
+                int bytesRead;
+                while (offset < size && (bytesRead = is.read(readData, offset, size - offset)) != -1) {
+                    offset += bytesRead;
+                }
+                assertEquals(size, offset, "Should read all bytes");
+                assertArrayEquals(data, readData, "Data should match");
+            }
+        }
+    }
+
+    /**
+     * Tests for file attribute manipulation (setting and getting attributes).
+     */
+    @Nested
+    class FileAttributeManipulationTests {
+
+        @Test
+        void testCanReadAndCanWrite() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "rwtest.txt"), context);
+
+            file.createNewFile();
+
+            // File should be readable and writable by owner
+            assertTrue(file.canRead(), "File should be readable");
+            assertTrue(file.canWrite(), "File should be writable");
+        }
+
+        @Test
+        void testSetReadOnlyAndReadWrite() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "readonly.txt"), context);
+
+            file.createNewFile();
+
+            // Set read-only
+            file.setReadOnly();
+            assertTrue(file.canRead(), "File should still be readable");
+            // Without this the read-only state itself went unchecked, so setReadOnly() doing nothing would pass
+            assertFalse(file.canWrite(), "File should not be writable while read-only");
+
+            // Set back to read-write
+            file.setReadWrite();
+            assertTrue(file.canRead(), "File should be readable");
+            assertTrue(file.canWrite(), "File should be writable again");
+        }
+
+        @Test
+        void testGetAndSetAttributes() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "attrtest.txt"), context);
+
+            file.createNewFile();
+
+            final int attrs = file.getAttributes();
+
+            // assertNotNull on an int is unfalsifiable once it is boxed, so this asserted nothing whatsoever: a
+            // getAttributes() returning garbage, and a setAttributes() throwing every time, both passed. What can
+            // be checked is that a bit written comes back, since ATTR_READONLY (0x01) survives both ATTR_SET_MASK
+            // and ATTR_GET_MASK, and setPathInformation expires the attribute cache so the read reaches the server.
+            file.setAttributes(attrs | SmbConstants.ATTR_READONLY);
+            assertEquals(SmbConstants.ATTR_READONLY, file.getAttributes() & SmbConstants.ATTR_READONLY,
+                    "the read-only bit should survive a round trip through the server");
+
+            file.setAttributes(attrs & ~SmbConstants.ATTR_READONLY);
+            assertEquals(0, file.getAttributes() & SmbConstants.ATTR_READONLY, "the read-only bit should have been cleared again");
+        }
+
+        @Test
+        void testCreateTimeAndLastAccessTime() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "timestest.txt"), context);
+
+            final long beforeCreate = System.currentTimeMillis();
+            file.createNewFile();
+            final long afterCreate = System.currentTimeMillis();
+
+            // Test createTime
+            final long createTime = file.createTime();
+            assertTrue(createTime > 0, "Create time should be positive");
+            assertTrue(createTime >= beforeCreate - 60000 && createTime <= afterCreate + 60000,
+                    "Create time should be around current time");
+
+            // Test lastAccess
+            final long lastAccess = file.lastAccess();
+            assertTrue(lastAccess > 0, "Last access time should be positive");
+        }
+
+        @Test
+        void testSetLastModified() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "modtest.txt"), context);
+
+            file.createNewFile();
+
+            // Set last modified time to a specific time
+            final long newTime = System.currentTimeMillis() - 86400000; // 1 day ago
+            file.setLastModified(newTime);
+
+            // Verify the time was set (allowing for some tolerance)
+            final long actualTime = file.lastModified();
+            assertTrue(Math.abs(actualTime - newTime) < 5000, "Last modified time should be close to set value");
+        }
+
+        @Test
+        void testSetFileTimes() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "filetimes.txt"), context);
+
+            file.createNewFile();
+
+            final long createTime = System.currentTimeMillis() - 172800000; // 2 days ago
+            final long modifiedTime = System.currentTimeMillis() - 86400000; // 1 day ago
+            final long accessTime = System.currentTimeMillis(); // now
+
+            // Set all times at once
+            file.setFileTimes(createTime, modifiedTime, accessTime);
+
+            // Verify (allowing for some tolerance due to SMB time resolution)
+            assertTrue(Math.abs(file.lastModified() - modifiedTime) < 5000, "Last modified time should be close to set value");
+        }
+
+        @Test
+        void testSetCreateTimeAndLastAccessTime() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "settimes.txt"), context);
+
+            file.createNewFile();
+
+            final long newCreateTime = System.currentTimeMillis() - 86400000; // 1 day ago
+            final long newAccessTime = System.currentTimeMillis();
+
+            // Set create time
+            file.setCreateTime(newCreateTime);
+
+            // Set last access time
+            file.setLastAccess(newAccessTime);
+
+            // Verify times were set (allowing for tolerance)
+            assertTrue(Math.abs(file.createTime() - newCreateTime) < 5000, "Create time should be close to set value");
+        }
+
+        @Test
+        void testIsHidden() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "visiblefile.txt"), context);
+
+            file.createNewFile();
+
+            // Normal files should not be hidden
+            assertFalse(file.isHidden(), "Regular file should not be hidden");
+        }
+    }
+
+    /**
+     * Tests for file copy operations.
+     */
+    @Nested
+    class FileCopyTests {
+
+        @Test
+        void testCopyFileInSameDirectory() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile source = new SmbFile(createSmbUrl("users", "source.txt"), context);
+            final SmbFile dest = new SmbFile(createSmbUrl("users", "copy.txt"), context);
+
+            final String content = "Test copy content";
+            try (OutputStream os = source.getOutputStream()) {
+                os.write(content.getBytes(StandardCharsets.UTF_8));
+            }
+
+            // Copy file
+            source.copyTo(dest);
+
+            // Verify both files exist
+            assertTrue(source.exists(), "Source file should still exist after copy");
+            assertTrue(dest.exists(), "Destination file should exist after copy");
+
+            // Verify content
+            try (InputStream is = dest.getInputStream()) {
+                final byte[] buffer = new byte[1024];
+                final int bytesRead = is.read(buffer);
+                final String readContent = new String(buffer, 0, bytesRead, StandardCharsets.UTF_8);
+                assertEquals(content, readContent, "Copied file should have same content");
+            }
+        }
+
+        @Test
+        void testCopyFileToDifferentDirectory() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile source = new SmbFile(createSmbUrl("users", "original.txt"), context);
+            final SmbFile destDir = new SmbFile(createSmbUrl("users", "copydir/"), context);
+            final SmbFile dest = new SmbFile(createSmbUrl("users", "copydir/original.txt"), context);
+
+            destDir.mkdir();
+
+            final String content = "Copy to different directory";
+            try (OutputStream os = source.getOutputStream()) {
+                os.write(content.getBytes(StandardCharsets.UTF_8));
+            }
+
+            // Copy file
+            source.copyTo(dest);
+
+            assertTrue(dest.exists(), "Destination file should exist");
+            assertEquals(source.length(), dest.length(), "File sizes should match");
+        }
+
+        @Test
+        void testCopyLargeFile() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile source = new SmbFile(createSmbUrl("users", "largesource.dat"), context);
+            final SmbFile dest = new SmbFile(createSmbUrl("users", "largedest.dat"), context);
+
+            final int size = 1024 * 1024; // 1MB
+            final byte[] data = new byte[size];
+            for (int i = 0; i < size; i++) {
+                data[i] = (byte) (i % 256);
+            }
+
+            try (OutputStream os = source.getOutputStream()) {
+                os.write(data);
+            }
+
+            // Copy large file
+            source.copyTo(dest);
+
+            assertEquals(source.length(), dest.length(), "File sizes should match after copy");
+        }
+
+        @Test
+        void testCopyPreservesTimestampsForRegularFile() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile source = new SmbFile(createSmbUrl("users", "timestampsource.txt"), context);
+            final SmbFile dest = new SmbFile(createSmbUrl("users", "timestampdest.txt"), context);
+
+            final String content = "Test timestamp preservation";
+            try (OutputStream os = source.getOutputStream()) {
+                os.write(content.getBytes(StandardCharsets.UTF_8));
+            }
+
+            // Set specific timestamps on source file
+            final long createTime = System.currentTimeMillis() - 172800000; // 2 days ago
+            final long modifiedTime = System.currentTimeMillis() - 86400000; // 1 day ago
+            final long accessTime = System.currentTimeMillis() - 43200000; // 12 hours ago
+
+            source.setFileTimes(createTime, modifiedTime, accessTime);
+
+            // Get actual timestamps from source (may differ slightly due to SMB time resolution)
+            final long srcCreateTime = source.createTime();
+            final long srcModifiedTime = source.lastModified();
+            final long srcAccessTime = source.lastAccess();
+            final int srcAttributes = source.getAttributes();
+
+            // Copy file
+            source.copyTo(dest);
+
+            // Verify timestamps are preserved (allowing 5 second tolerance for SMB time resolution)
+            assertTrue(Math.abs(dest.createTime() - srcCreateTime) < 5000,
+                    String.format("Create time should be preserved (expected: %d, actual: %d)", srcCreateTime, dest.createTime()));
+            assertTrue(Math.abs(dest.lastModified() - srcModifiedTime) < 5000,
+                    String.format("Modified time should be preserved (expected: %d, actual: %d)", srcModifiedTime, dest.lastModified()));
+            assertTrue(Math.abs(dest.lastAccess() - srcAccessTime) < 5000,
+                    String.format("Access time should be preserved (expected: %d, actual: %d)", srcAccessTime, dest.lastAccess()));
+
+            // Verify attributes are preserved
+            assertEquals(srcAttributes, dest.getAttributes(), "Attributes should be preserved");
+
+            // Verify content is intact
+            try (InputStream is = dest.getInputStream()) {
+                final byte[] buffer = new byte[1024];
+                final int bytesRead = is.read(buffer);
+                final String readContent = new String(buffer, 0, bytesRead, StandardCharsets.UTF_8);
+                assertEquals(content, readContent, "Content should be preserved");
+            }
+        }
+
+        @Test
+        void testCopyPreservesTimestampsForEmptyFile() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile source = new SmbFile(createSmbUrl("users", "emptysource.txt"), context);
+            final SmbFile dest = new SmbFile(createSmbUrl("users", "emptydest.txt"), context);
+
+            // Create empty file
+            source.createNewFile();
+
+            // Set specific timestamps on empty source file
+            final long createTime = System.currentTimeMillis() - 172800000; // 2 days ago
+            final long modifiedTime = System.currentTimeMillis() - 86400000; // 1 day ago
+            final long accessTime = System.currentTimeMillis() - 43200000; // 12 hours ago
+
+            source.setFileTimes(createTime, modifiedTime, accessTime);
+
+            // Get actual timestamps from source
+            final long srcCreateTime = source.createTime();
+            final long srcModifiedTime = source.lastModified();
+            final long srcAccessTime = source.lastAccess();
+
+            // Copy empty file
+            source.copyTo(dest);
+
+            // Verify file is empty
+            assertEquals(0, dest.length(), "Copied file should be empty");
+
+            // Verify timestamps are preserved for empty files (allowing 5 second tolerance)
+            assertTrue(Math.abs(dest.createTime() - srcCreateTime) < 5000, String
+                    .format("Create time should be preserved for empty file (expected: %d, actual: %d)", srcCreateTime, dest.createTime()));
+            assertTrue(Math.abs(dest.lastModified() - srcModifiedTime) < 5000, String.format(
+                    "Modified time should be preserved for empty file (expected: %d, actual: %d)", srcModifiedTime, dest.lastModified()));
+            assertTrue(Math.abs(dest.lastAccess() - srcAccessTime) < 5000, String
+                    .format("Access time should be preserved for empty file (expected: %d, actual: %d)", srcAccessTime, dest.lastAccess()));
+        }
+
+        @Test
+        void testCopyPreservesTimestampsAcrossDirectories() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile sourceDir = new SmbFile(createSmbUrl("users", "srcdir/"), context);
+            final SmbFile destDir = new SmbFile(createSmbUrl("users", "destdir/"), context);
+
+            sourceDir.mkdir();
+            destDir.mkdir();
+
+            final SmbFile source = new SmbFile(createSmbUrl("users", "srcdir/file.txt"), context);
+            final SmbFile dest = new SmbFile(createSmbUrl("users", "destdir/file.txt"), context);
+
+            final String content = "Cross-directory copy";
+            try (OutputStream os = source.getOutputStream()) {
+                os.write(content.getBytes(StandardCharsets.UTF_8));
+            }
+
+            // Set specific timestamps
+            final long createTime = System.currentTimeMillis() - 172800000;
+            final long modifiedTime = System.currentTimeMillis() - 86400000;
+            final long accessTime = System.currentTimeMillis() - 43200000;
+
+            source.setFileTimes(createTime, modifiedTime, accessTime);
+
+            final long srcCreateTime = source.createTime();
+            final long srcModifiedTime = source.lastModified();
+            final long srcAccessTime = source.lastAccess();
+
+            // Copy across directories
+            source.copyTo(dest);
+
+            // Verify timestamps are preserved across directories
+            assertTrue(Math.abs(dest.createTime() - srcCreateTime) < 5000, "Create time should be preserved across directories");
+            assertTrue(Math.abs(dest.lastModified() - srcModifiedTime) < 5000, "Modified time should be preserved across directories");
+            assertTrue(Math.abs(dest.lastAccess() - srcAccessTime) < 5000, "Access time should be preserved across directories");
+        }
+
+        @Test
+        void testCopyPreservesFileAttributes() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile source = new SmbFile(createSmbUrl("users", "attrsource.txt"), context);
+            final SmbFile dest = new SmbFile(createSmbUrl("users", "attrdest.txt"), context);
+
+            final String content = "Attribute preservation test";
+            try (OutputStream os = source.getOutputStream()) {
+                os.write(content.getBytes(StandardCharsets.UTF_8));
+            }
+
+            // Set file to read-only and set timestamps
+            source.setReadOnly();
+            final long createTime = System.currentTimeMillis() - 172800000;
+            final long modifiedTime = System.currentTimeMillis() - 86400000;
+            final long accessTime = System.currentTimeMillis() - 43200000;
+
+            source.setFileTimes(createTime, modifiedTime, accessTime);
+
+            final long srcCreateTime = source.createTime();
+            final long srcModifiedTime = source.lastModified();
+            final long srcAccessTime = source.lastAccess();
+            final int srcAttributes = source.getAttributes();
+
+            // Copy file
+            source.copyTo(dest);
+
+            // Verify both attributes and timestamps are preserved
+            assertEquals(srcAttributes, dest.getAttributes(), "File attributes should be preserved");
+
+            assertTrue(Math.abs(dest.createTime() - srcCreateTime) < 5000, "Create time should be preserved with attributes");
+            assertTrue(Math.abs(dest.lastModified() - srcModifiedTime) < 5000, "Modified time should be preserved with attributes");
+            assertTrue(Math.abs(dest.lastAccess() - srcAccessTime) < 5000, "Access time should be preserved with attributes");
+
+            // Reset read-only flag for cleanup
+            dest.setReadWrite();
+        }
+
+        @Test
+        void testCopyPreservesTimestampsForLargeFile() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile source = new SmbFile(createSmbUrl("users", "largetimestamp.dat"), context);
+            final SmbFile dest = new SmbFile(createSmbUrl("users", "largetimestampdest.dat"), context);
+
+            // Create a larger file (1MB) to test chunked copy path
+            final int size = 1024 * 1024; // 1MB
+            final byte[] data = new byte[size];
+            for (int i = 0; i < size; i++) {
+                data[i] = (byte) (i % 256);
+            }
+
+            try (OutputStream os = source.getOutputStream()) {
+                os.write(data);
+            }
+
+            // Set specific timestamps
+            final long createTime = System.currentTimeMillis() - 172800000;
+            final long modifiedTime = System.currentTimeMillis() - 86400000;
+            final long accessTime = System.currentTimeMillis() - 43200000;
+
+            source.setFileTimes(createTime, modifiedTime, accessTime);
+
+            final long srcCreateTime = source.createTime();
+            final long srcModifiedTime = source.lastModified();
+            final long srcAccessTime = source.lastAccess();
+
+            // Copy large file
+            source.copyTo(dest);
+
+            // Verify file size matches
+            assertEquals(source.length(), dest.length(), "File sizes should match");
+
+            // Verify timestamps are preserved for large files
+            assertTrue(Math.abs(dest.createTime() - srcCreateTime) < 5000, "Create time should be preserved for large files");
+            assertTrue(Math.abs(dest.lastModified() - srcModifiedTime) < 5000, "Modified time should be preserved for large files");
+            assertTrue(Math.abs(dest.lastAccess() - srcAccessTime) < 5000, "Access time should be preserved for large files");
+        }
+    }
+
+    /**
+     * Tests for edge cases and boundary conditions.
+     */
+    @Nested
+    class EdgeCasesAndBoundaryTests {
+
+        @Test
+        void testZeroByteFile() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "zerobyte.txt"), context);
+
+            // Create empty file
+            try (OutputStream os = file.getOutputStream()) {
+                // Write nothing
+            }
+
+            assertTrue(file.exists(), "Zero-byte file should exist");
+            assertEquals(0, file.length(), "File size should be 0");
+
+            // Read from empty file
+            try (InputStream is = file.getInputStream()) {
+                final int b = is.read();
+                assertEquals(-1, b, "Reading from empty file should return -1");
+            }
+        }
+
+        @Test
+        void testFileWithSpacesInName() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "file with spaces.txt"), context);
+
+            file.createNewFile();
+            assertTrue(file.exists(), "File with spaces in name should be created");
+
+            final String content = "Spaces in filename";
+            try (OutputStream os = file.getOutputStream()) {
+                os.write(content.getBytes(StandardCharsets.UTF_8));
+            }
+
+            try (InputStream is = file.getInputStream()) {
+                final byte[] buffer = new byte[1024];
+                final int bytesRead = is.read(buffer);
+                assertEquals(content, new String(buffer, 0, bytesRead, StandardCharsets.UTF_8));
+            }
+        }
+
+        @Test
+        void testFileWithSpecialCharacters() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            // Test various special characters that are typically allowed in filenames
+            final SmbFile file = new SmbFile(createSmbUrl("users", "file!@#$%^&()_+-=.txt"), context);
+
+            file.createNewFile();
+            assertTrue(file.exists(), "File with special characters should be created");
+        }
+
+        @Test
+        void testFileWithJapaneseCharacters() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "テストファイル.txt"), context);
+
+            file.createNewFile();
+            assertTrue(file.exists(), "File with Japanese characters should be created");
+
+            final String content = "日本語コンテンツ";
+            try (OutputStream os = file.getOutputStream()) {
+                os.write(content.getBytes(StandardCharsets.UTF_8));
+            }
+
+            try (InputStream is = file.getInputStream()) {
+                final byte[] buffer = new byte[1024];
+                final int bytesRead = is.read(buffer);
+                assertEquals(content, new String(buffer, 0, bytesRead, StandardCharsets.UTF_8));
+            }
+        }
+
+        @Test
+        void testDeepDirectoryHierarchy() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final String deepPath = "level1/level2/level3/level4/level5/level6/level7/level8/level9/level10/";
+            final SmbFile deepDir = new SmbFile(createSmbUrl("users", deepPath), context);
+
+            // Create deep directory structure
+            deepDir.mkdirs();
+            assertTrue(deepDir.exists(), "Deep directory should exist");
+            assertTrue(deepDir.isDirectory(), "Should be a directory");
+
+            // Create file in deep directory
+            final SmbFile file = new SmbFile(createSmbUrl("users", deepPath + "deepfile.txt"), context);
+            file.createNewFile();
+            assertTrue(file.exists(), "File in deep directory should exist");
+        }
+
+        @Test
+        void testManyFilesInDirectory() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile dir = new SmbFile(createSmbUrl("users", "manyfiles/"), context);
+            dir.mkdir();
+
+            final int fileCount = 50;
+            // Create many files
+            for (int i = 0; i < fileCount; i++) {
+                final SmbFile file = new SmbFile(createSmbUrl("users", "manyfiles/file" + i + ".txt"), context);
+                file.createNewFile();
+            }
+
+            // List all files
+            final SmbResource[] files = dir.listFiles();
+            assertNotNull(files, "File list should not be null");
+            assertEquals(fileCount, files.length, "Should have " + fileCount + " files");
+        }
+
+        @Test
+        void testEmptyDirectory() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile dir = new SmbFile(createSmbUrl("users", "emptydir/"), context);
+            dir.mkdir();
+
+            final SmbResource[] files = dir.listFiles();
+            assertNotNull(files, "File list should not be null");
+            assertEquals(0, files.length, "Empty directory should have no files");
+        }
+
+        @Test
+        void testLongFileName() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            // Create a filename with 200 characters (within typical limits)
+            final String longName = "a".repeat(200) + ".txt";
+            final SmbFile file = new SmbFile(createSmbUrl("users", longName), context);
+
+            file.createNewFile();
+            assertTrue(file.exists(), "File with long name should be created");
+        }
+
+        @Test
+        void testMultipleConsecutiveOperations() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "multiop.txt"), context);
+
+            // Create, write, read, modify, read again
+            file.createNewFile();
+
+            try (OutputStream os = file.getOutputStream()) {
+                os.write("First content".getBytes(StandardCharsets.UTF_8));
+            }
+
+            try (InputStream is = file.getInputStream()) {
+                final byte[] buffer = new byte[1024];
+                is.read(buffer);
+            }
+
+            try (OutputStream os = file.getOutputStream()) {
+                os.write("Second content".getBytes(StandardCharsets.UTF_8));
+            }
+
+            try (InputStream is = file.getInputStream()) {
+                final byte[] buffer = new byte[1024];
+                final int bytesRead = is.read(buffer);
+                assertEquals("Second content", new String(buffer, 0, bytesRead, StandardCharsets.UTF_8));
+            }
+        }
+    }
+
+    /**
+     * Tests for path operations and metadata.
+     */
+    @Nested
+    class PathAndMetadataTests {
+
+        @Test
+        void testGetName() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "testfile.txt"), context);
+
+            file.createNewFile();
+
+            assertEquals("testfile.txt", file.getName(), "File name should match");
+        }
+
+        @Test
+        void testGetParent() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "subdir/file.txt"), context);
+
+            final String parent = file.getParent();
+            assertNotNull(parent, "Parent path should not be null");
+            assertTrue(parent.contains("users"), "Parent should contain share name");
+        }
+
+        @Test
+        void testGetPath() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "testpath.txt"), context);
+
+            file.createNewFile();
+
+            final String path = file.getPath();
+            assertNotNull(path, "Path should not be null");
+            assertTrue(path.contains("testpath.txt"), "Path should contain filename");
+        }
+
+        @Test
+        void testGetUncPath() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "unctest.txt"), context);
+
+            final String uncPath = file.getUncPath();
+            assertNotNull(uncPath, "UNC path should not be null");
+            // UNC path is relative to the share and starts with single backslash
+            assertTrue(uncPath.startsWith("\\"), "UNC path should start with \\");
+            assertTrue(uncPath.contains("unctest.txt"), "UNC path should contain the filename");
+        }
+
+        @Test
+        void testGetShare() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "sharefile.txt"), context);
+
+            final String share = file.getShare();
+            assertNotNull(share, "Share should not be null");
+            assertTrue(share.contains("users"), "Share should be 'users'");
+        }
+
+        @Test
+        void testGetServer() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "servertest.txt"), context);
+
+            final String server = file.getServer();
+            assertNotNull(server, "Server should not be null");
+            assertEquals(server().host(), server, "Server should match the configured host");
+        }
+
+        @Test
+        void testGetCanonicalPath() throws Exception {
+            final CIFSContext context = createContext(TESTUSER1, password());
+            final SmbFile file = new SmbFile(createSmbUrl("users", "canonical.txt"), context);
+
+            file.createNewFile();
+
+            final String canonicalPath = file.getCanonicalPath();
+            assertNotNull(canonicalPath, "Canonical path should not be null");
+            assertTrue(canonicalPath.contains("canonical.txt"), "Canonical path should contain filename");
+        }
+    }
+}

@@ -16,8 +16,7 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 /*
- * Modified by Ohalo Ltd on 2026-08-17: default the encryptionRequired and encryptionCiphers
- * properties, and parse cipher names into MS-SMB2 cipher identifiers.
+ * Modified by Ohalo Ltd on 2026-10-01: default jcifs.client.encryptionRequired to false.
  */
 package org.codelibs.jcifs.smb.config;
 
@@ -30,7 +29,6 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.StringTokenizer;
@@ -41,6 +39,8 @@ import org.codelibs.jcifs.smb.Configuration;
 import org.codelibs.jcifs.smb.DialectVersion;
 import org.codelibs.jcifs.smb.ResolverType;
 import org.codelibs.jcifs.smb.SmbConstants;
+import org.codelibs.jcifs.smb.internal.smb2.nego.EncryptionNegotiateContext;
+import org.codelibs.jcifs.smb.internal.smb2.nego.SigningNegotiateContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -81,10 +81,14 @@ public class BaseConfiguration implements Configuration {
     protected boolean ipcSigningEnforced = true;
     /** Whether SMB3 encryption is enabled */
     protected boolean encryptionEnabled = false;
-    /** Whether SMB3 encryption is required, failing connections that cannot encrypt */
+    /** Whether SMB3 encryption is required, failing sessions that cannot encrypt */
     protected boolean encryptionRequired = false;
-    /** Encryption ciphers offered in SMB 3.1.1 negotiation, most preferred first (MS-SMB2 cipher IDs) */
+    /** Whether SMB3 compression is enabled */
+    protected boolean compressionEnabled = false;
+    /** SMB 3.1.1 encryption ciphers to offer, in preference order */
     protected int[] encryptionCiphers;
+    /** SMB 3.1.1 signing algorithms to offer, in preference order */
+    protected int[] signingAlgorithms;
     /** Whether to use NT status codes instead of DOS error codes */
     protected boolean useNtStatus = true;
     /** Whether to use extended security negotiation */
@@ -151,6 +155,8 @@ public class BaseConfiguration implements Configuration {
     protected int vcNumber = 1;
     /** Whether DFS support is disabled */
     protected boolean dfsDisabled = false;
+    /** Whether a symbolic link the server refuses to follow is resolved by the client */
+    protected boolean followSymlinks = false;
     /** DFS cache time-to-live in seconds */
     protected long dfsTTL = 300;
     /** Whether to use strict DFS path resolution */
@@ -195,8 +201,17 @@ public class BaseConfiguration implements Configuration {
     protected InetAddress broadcastAddress;
     /** Order of name resolution methods to use */
     protected List<ResolverType> resolverOrder;
-    /** Maximum buffer size for IO operations */
-    protected int maximumBufferSize = 0x10000;
+    /**
+     * Maximum buffer size for IO operations.
+     *
+     * <p>
+     * This bounds a whole message, so it has to leave room for the largest transfer plus its headers: a write of
+     * {@link #maximumTransferSize} bytes encodes to that plus 112.
+     * </p>
+     */
+    protected int maximumBufferSize = 0x101000;
+    /** Largest payload a single SMB2 read or write may carry */
+    protected int maximumTransferSize = SmbConstants.DEFAULT_MAX_TRANSFER_SIZE;
     /** Maximum buffer size for SMB transaction operations */
     protected int transactionBufferSize = 0xFFFF - 512;
     /** Number of buffers to keep in cache */
@@ -387,6 +402,11 @@ public class BaseConfiguration implements Configuration {
     }
 
     @Override
+    public boolean isFollowSymlinks() {
+        return this.followSymlinks;
+    }
+
+    @Override
     public boolean isDfsStrictView() {
         return this.dfsStrictView;
     }
@@ -572,36 +592,18 @@ public class BaseConfiguration implements Configuration {
     }
 
     @Override
+    public boolean isCompressionEnabled() {
+        return this.compressionEnabled;
+    }
+
+    @Override
     public int[] getEncryptionCiphers() {
         return this.encryptionCiphers;
     }
 
-    /**
-     * Parse a comma-separated list of encryption cipher names into MS-SMB2
-     * cipher identifiers, most preferred first.
-     *
-     * @param cipherNames comma-separated cipher names, or null/blank for the
-     *            default preference order per MS-SMB2 2.2.3.1.2
-     * @throws CIFSException on an unknown cipher name
-     */
-    protected void initEncryptionCiphers(final String cipherNames) throws CIFSException {
-        if (cipherNames == null || cipherNames.isBlank()) {
-            this.encryptionCiphers =
-                    new int[] { 0x04 /* AES-256-GCM */, 0x02 /* AES-128-GCM */, 0x03 /* AES-256-CCM */, 0x01 /* AES-128-CCM */ };
-            return;
-        }
-        final String[] names = cipherNames.split(",");
-        final int[] ids = new int[names.length];
-        for (int i = 0; i < names.length; i++) {
-            ids[i] = switch (names[i].trim().toUpperCase(Locale.ROOT).replace('_', '-')) {
-            case "AES-128-CCM" -> 0x01;
-            case "AES-128-GCM" -> 0x02;
-            case "AES-256-CCM" -> 0x03;
-            case "AES-256-GCM" -> 0x04;
-            default -> throw new CIFSException("Unknown encryption cipher " + names[i].trim());
-            };
-        }
-        this.encryptionCiphers = ids;
+    @Override
+    public int[] getSigningAlgorithms() {
+        return this.signingAlgorithms;
     }
 
     @Override
@@ -617,6 +619,11 @@ public class BaseConfiguration implements Configuration {
     @Override
     public int getMaximumBufferSize() {
         return this.maximumBufferSize;
+    }
+
+    @Override
+    public int getMaximumTransferSize() {
+        return this.maximumTransferSize;
     }
 
     @Override
@@ -806,6 +813,119 @@ public class BaseConfiguration implements Configuration {
     }
 
     /**
+     * Initializes the SMB 3.1.1 encryption ciphers to offer.
+     *
+     * <p>
+     * Unlike the resolver order, an unrecognised name here is fatal rather than logged and skipped. Dropping an
+     * entry would leave the client offering something other than what was configured, and a typo in a cipher list
+     * changes what protects the data - this is the one case that must not fail open.
+     * </p>
+     *
+     * @param prop comma-separated list of cipher names, in preference order, or null for the default
+     * @throws CIFSException if a cipher name is not recognised
+     */
+    protected void initEncryptionCiphers(final String prop) throws CIFSException {
+        if (prop == null || prop.trim().isEmpty()) {
+            // AES-128-GCM leads deliberately. A server chooses one cipher from the client's offer and may apply
+            // its own preference order when doing so, so leading with AES-128 leaves the cipher an existing
+            // deployment negotiates exactly as it was, while still making AES-256 available to a server that
+            // prefers it.
+            this.encryptionCiphers = new int[] { EncryptionNegotiateContext.CIPHER_AES128_GCM, EncryptionNegotiateContext.CIPHER_AES128_CCM,
+                    EncryptionNegotiateContext.CIPHER_AES256_GCM, EncryptionNegotiateContext.CIPHER_AES256_CCM };
+            return;
+        }
+
+        final List<Integer> ciphers = new ArrayList<>();
+        final StringTokenizer st = new StringTokenizer(prop, ",");
+        while (st.hasMoreTokens()) {
+            final String name = st.nextToken().trim();
+            if (name.isEmpty()) {
+                continue;
+            }
+            ciphers.add(cipherByName(name));
+        }
+        if (ciphers.isEmpty()) {
+            throw new CIFSException("No encryption cipher named in jcifs.client.encryptionCiphers: " + prop);
+        }
+
+        this.encryptionCiphers = new int[ciphers.size()];
+        for (int i = 0; i < ciphers.size(); i++) {
+            this.encryptionCiphers[i] = ciphers.get(i);
+        }
+    }
+
+    /**
+     * Initializes the SMB 3.1.1 signing algorithms to offer.
+     *
+     * <p>
+     * An unrecognised name is fatal here for the same reason it is for the ciphers: dropping an entry would leave
+     * the client offering something other than what was configured, and this setting decides what protects
+     * message integrity.
+     * </p>
+     *
+     * @param prop comma-separated list of algorithm names, in preference order, or null for the default
+     * @throws CIFSException if an algorithm name is not recognised
+     */
+    protected void initSigningAlgorithms(final String prop) throws CIFSException {
+        if (prop == null || prop.trim().isEmpty()) {
+            // AES-CMAC leads deliberately: it is what this client has always signed with, and a server chooses
+            // from the offer by its own preference, so leading with it keeps the negotiated algorithm unchanged
+            // for every existing deployment while making GMAC available to anyone who asks for it.
+            this.signingAlgorithms = new int[] { SigningNegotiateContext.SIGNING_ALGO_AES128_CMAC,
+                    SigningNegotiateContext.SIGNING_ALGO_AES128_GMAC, SigningNegotiateContext.SIGNING_ALGO_HMAC_SHA256 };
+            return;
+        }
+
+        final List<Integer> algos = new ArrayList<>();
+        final StringTokenizer st = new StringTokenizer(prop, ",");
+        while (st.hasMoreTokens()) {
+            final String name = st.nextToken().trim();
+            if (name.isEmpty()) {
+                continue;
+            }
+            algos.add(signingAlgorithmByName(name));
+        }
+        if (algos.isEmpty()) {
+            throw new CIFSException("No signing algorithm named in jcifs.client.signingAlgorithms: " + prop);
+        }
+
+        this.signingAlgorithms = new int[algos.size()];
+        for (int i = 0; i < algos.size(); i++) {
+            this.signingAlgorithms[i] = algos.get(i);
+        }
+    }
+
+    private static int signingAlgorithmByName(final String name) throws CIFSException {
+        if (name.equalsIgnoreCase("HMAC-SHA256")) {
+            return SigningNegotiateContext.SIGNING_ALGO_HMAC_SHA256;
+        }
+        if (name.equalsIgnoreCase("AES-CMAC")) {
+            return SigningNegotiateContext.SIGNING_ALGO_AES128_CMAC;
+        }
+        if (name.equalsIgnoreCase("AES-GMAC")) {
+            return SigningNegotiateContext.SIGNING_ALGO_AES128_GMAC;
+        }
+        throw new CIFSException("Unknown signing algorithm '" + name + "'; expected one of HMAC-SHA256, AES-CMAC, AES-GMAC");
+    }
+
+    private static int cipherByName(final String name) throws CIFSException {
+        if (name.equalsIgnoreCase("AES-128-CCM")) {
+            return EncryptionNegotiateContext.CIPHER_AES128_CCM;
+        }
+        if (name.equalsIgnoreCase("AES-128-GCM")) {
+            return EncryptionNegotiateContext.CIPHER_AES128_GCM;
+        }
+        if (name.equalsIgnoreCase("AES-256-CCM")) {
+            return EncryptionNegotiateContext.CIPHER_AES256_CCM;
+        }
+        if (name.equalsIgnoreCase("AES-256-GCM")) {
+            return EncryptionNegotiateContext.CIPHER_AES256_GCM;
+        }
+        throw new CIFSException(
+                "Unknown encryption cipher '" + name + "'; expected one of AES-128-CCM, AES-128-GCM, AES-256-CCM, AES-256-GCM");
+    }
+
+    /**
      * Initializes the disallowed compound operations based on the provided property string.
      *
      * @param prop comma-separated list of operations to disallow in compound requests
@@ -847,10 +967,6 @@ public class BaseConfiguration implements Configuration {
             this.machineId = mid;
         }
 
-        if (this.encryptionCiphers == null) {
-            initEncryptionCiphers(null);
-        }
-
         if (this.nativeOs == null) {
             this.nativeOs = System.getProperty("os.name");
         }
@@ -884,6 +1000,16 @@ public class BaseConfiguration implements Configuration {
 
         if (this.minVersion == null || this.maxVersion == null) {
             initProtocolVersions((DialectVersion) null, null);
+        }
+
+        if (this.encryptionCiphers == null) {
+            // Every configuration needs this, not just the property-driven one: an unset array would reach
+            // EncryptionNegotiateContext as null the first time a caller enables encryption.
+            initEncryptionCiphers(null);
+        }
+
+        if (this.signingAlgorithms == null) {
+            initSigningAlgorithms(null);
         }
 
         if (this.disallowCompound == null) {

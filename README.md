@@ -14,11 +14,18 @@ JCIFS is a comprehensive, pure Java implementation of the CIFS/SMB networking pr
 - **SMB2**: Full SMB 2.0.2, 2.1 support with enhanced performance
 - **SMB3**: Complete SMB 3.0, 3.0.2, 3.1.1 implementation featuring:
   - **AES-128-CCM encryption** (SMB 3.0/3.0.2)
-  - **AES-128-GCM, AES-256-GCM, AES-256-CCM encryption** (SMB 3.1.1)
+  - **AES-128-GCM and AES-128-CCM encryption** (SMB 3.1.1)
+  - **AES-256-GCM and AES-256-CCM encryption** (SMB 3.1.1), offered by default and
+    selectable with `jcifs.client.encryptionCiphers`
   - **Pre-Authentication Integrity** (SMB 3.1.1)
-  - **AES-CMAC signing** for data integrity
+  - **AES-CMAC signing** for data integrity, with **AES-GMAC** negotiable on
+    SMB 3.1.1 via `jcifs.client.signingAlgorithms`
   - **Automatic protocol negotiation**
-  - **Transparent encryption** when required by server or share
+  - **Transparent encryption** when required by the server, per session or per share (opt-in, see below)
+
+See **[SMB2/SMB3 support status](docs/SMB3_SUPPORT.md)** for what is and is not
+implemented, feature by feature. Leases, oplocks, durable handles, multi-channel,
+directory leasing, compression, RDMA and the witness protocol are not implemented.
 
 ### **Security & Authentication**
 - **Multi-method Authentication**: NTLMSSP, Kerberos, SPNEGO
@@ -120,8 +127,8 @@ import org.codelibs.jcifs.smb.config.PropertyConfiguration;
 // Create context with domain credentials
 Properties props = new Properties();
 // Optional: Set SMB protocol preferences
-props.setProperty("jcifs.smb.client.minVersion", "SMB202");
-props.setProperty("jcifs.smb.client.maxVersion", "SMB311");
+props.setProperty("jcifs.client.minVersion", "SMB202");
+props.setProperty("jcifs.client.maxVersion", "SMB311");
 
 CIFSContext baseContext = new BaseContext(new PropertyConfiguration(props));
 NtlmPasswordAuthenticator auth = new NtlmPasswordAuthenticator(
@@ -192,53 +199,13 @@ try (SmbFile dir = new SmbFile("smb://server/share/monitored/", context);
 ```java
 // Advanced configuration
 Properties config = new Properties();
-config.setProperty("jcifs.smb.client.minVersion", "SMB300");  // Require SMB3+
-config.setProperty("jcifs.smb.client.maxVersion", "SMB311");
-config.setProperty("jcifs.smb.client.enableSMB2Signing", "true");  // Enable signing
-config.setProperty("jcifs.smb.client.signingPreferred", "true");
+config.setProperty("jcifs.client.minVersion", "SMB300");  // Require SMB3+
+config.setProperty("jcifs.client.maxVersion", "SMB311");
+config.setProperty("jcifs.client.signingEnforced", "true");  // Require signing
 config.setProperty("jcifs.resolveOrder", "LMHOSTS,DNS,WINS,BCAST");
 
 CIFSContext customContext = new BaseContext(new PropertyConfiguration(config));
 ```
-
-### SMB3 Channel Encryption
-
-SMB 3.x channel encryption protects all traffic after session setup. It is
-what servers enforcing *encryption in transit* expect - for example Azure
-Files with *Require encryption in transit* (enabled by default for new
-storage accounts), Windows Server shares with `-RequireEncryption $true`,
-NetApp volumes with required encryption, or Samba with
-`smb encrypt = required`.
-
-```java
-Properties config = new Properties();
-// offer and use encryption when the server or share requires it
-config.setProperty("jcifs.client.encryptionEnabled", "true");
-// optional: refuse to talk to servers that cannot encrypt (fail closed)
-config.setProperty("jcifs.client.encryptionRequired", "true");
-// optional: narrow the offered ciphers, most preferred first
-config.setProperty("jcifs.client.encryptionCiphers", "AES-256-GCM,AES-128-GCM");
-
-CIFSContext encryptedContext = new BaseContext(new PropertyConfiguration(config));
-```
-
-| Property | Default | Meaning |
-|----------|---------|---------|
-| `jcifs.client.encryptionEnabled` | `false` | Advertise encryption support during negotiation and encrypt transparently whenever the session or share requires it. |
-| `jcifs.client.encryptionRequired` | `false` | Demand encryption for every connection: sessions on servers that cannot or will not encrypt fail with a clear error instead of downgrading to cleartext. Implies advertising encryption support. |
-| `jcifs.client.encryptionCiphers` | `AES-256-GCM,AES-128-GCM,AES-256-CCM,AES-128-CCM` | Ciphers offered in SMB 3.1.1 negotiation, most preferred first. Narrow the list to restrict connections, e.g. `AES-256-GCM` only for Azure Files' *Maximum security* profile. |
-
-Supported ciphers by dialect:
-
-| Dialect | Ciphers |
-|---------|---------|
-| SMB 3.0 / 3.0.2 | AES-128-CCM (fixed by the protocol, no cipher negotiation) |
-| SMB 3.1.1 | AES-256-GCM, AES-128-GCM, AES-256-CCM, AES-128-CCM (negotiated) |
-
-Channel encryption does not exist before SMB 3.0 - make sure
-`jcifs.client.maxVersion` is not capped below `SMB300`, or encryption is
-silently unavailable. Messages taking the encrypted path are not signed;
-the AEAD authentication tag protects their integrity (per MS-SMB2).
 
 ## 🏗️ Architecture Overview
 
@@ -323,6 +290,89 @@ mvn verify
 mvn jacoco:report
 ```
 
+#### Integration tests against a real SMB server
+
+`mvn verify` also runs the `*IT` tests in `src/test/java/org/codelibs/jcifs/smb/it`,
+which talk to an actual SMB server. Two backends are supported and the same tests
+run against both.
+
+**Samba (default, no setup needed).** With Docker available, the harness builds
+and starts the container defined in `build_helpers/samba/` and points the tests at
+it. Nothing else is required:
+
+```bash
+mvn verify
+```
+
+That publishes Samba on a mapped port. A DFS referral names a host but no port,
+so the DFS tests skip unless the server answers on 445. The harness tries 445
+first and falls back, so on a machine already using that port Testcontainers logs
+one failed container start before the run continues normally. To run them anyway - on a
+machine whose own 445 is taken, for instance - put the server and the test JVM on
+the same Docker network:
+
+```bash
+./build_helpers/run-it-with-dfs.sh
+```
+
+**A real Windows server.** Run `build_helpers/win-setup.ps1` on the Windows
+machine to create the shares, symlinks and DFS namespace, then point the tests at
+it:
+
+```bash
+JCIFS_IT_BACKEND=windows \
+JCIFS_IT_HOST=<the Windows computer name> \
+JCIFS_IT_USER=testuser1 \
+JCIFS_IT_PASSWORD=<the password passed to win-setup.ps1> \
+mvn verify
+```
+
+This is what the nightly `SMB integration tests (Windows)` workflow does on a
+`windows-latest` runner, which is a Windows Server 2025 host.
+
+| Variable | Meaning |
+|---|---|
+| `JCIFS_IT_BACKEND` | `samba` or `windows`; unset starts the container |
+| `JCIFS_IT_HOST`, `JCIFS_IT_PORT` | where the server is; port defaults to 445 |
+| `JCIFS_IT_USER`, `JCIFS_IT_PASSWORD`, `JCIFS_IT_DOMAIN` | credentials |
+| `JCIFS_IT_SHARE`, `JCIFS_IT_SHARE_ENCRYPTED`, `JCIFS_IT_DFS_ROOT`, `JCIFS_IT_SHARE_SYMLINKS` | share names |
+| `JCIFS_IT_REQUIRED` | `true` makes a missing environment a failure instead of a skip |
+| `JCIFS_IT_DIALECT` | pins the whole suite to one SMB2/SMB3 dialect, e.g. `SMB300` |
+
+Before any test runs, a preflight check confirms the server is configured the way
+the tests assume - in particular that the encrypted share really does reject a
+client that cannot encrypt, and that a pinned dialect is actually honoured.
+Without those checks a green run would not mean much.
+
+Some tests skip by design: DFS referrals name a host but no port, so they only
+run when the server answers on 445 (a development machine that is already sharing
+files will skip them), and tests marked `@RequiresBackend` run on one backend
+only.
+
+### Choosing a dialect
+
+Left alone, the client and the server negotiate the highest dialect they both
+support, which for either backend means SMB 3.1.1 - so everything below it goes
+unproven. `JCIFS_IT_DIALECT` pins both ends of the negotiation range and runs the
+same tests on one dialect:
+
+```bash
+JCIFS_IT_DIALECT=SMB300 mvn verify
+```
+
+CI does this as a matrix: SMB 3.0 on every pull request and the full range
+nightly against Windows, and SMB 2.0.2 through 3.1.1 against Samba. A test of a
+feature the pinned dialect cannot reach - encryption below SMB 3.0, say - carries
+`@RequiresDialect` and skips rather than failing; the skips are listed in the job
+summary.
+
+Individual tests can sweep dialects on their own with `@DialectMatrix` (SMB 2.0.2
+through 3.1.1) or `@Smb3Matrix` (SMB 3.0, 3.0.2 and 3.1.1), taking the dialect as
+a parameter and building their context with `contextFor(dialect)`.
+
+SMB1 is deliberately out of scope here: the integration suite negotiates SMB2 and
+above, and SMB1 is covered by the unit tests, which run on every build.
+
 ## ⚡ Performance Considerations
 
 ### Connection Management
@@ -345,24 +395,31 @@ try (InputStream is = smbFile.getInputStream()) {
 ### Protocol Selection
 ```java
 // For maximum performance on modern servers
-props.setProperty("jcifs.smb.client.minVersion", "SMB300");
-props.setProperty("jcifs.smb.client.maxVersion", "SMB311");
+props.setProperty("jcifs.client.minVersion", "SMB300");
+props.setProperty("jcifs.client.maxVersion", "SMB311");
 
 // For maximum compatibility (default)
-props.setProperty("jcifs.smb.client.minVersion", "SMB1");
-props.setProperty("jcifs.smb.client.maxVersion", "SMB311");
+props.setProperty("jcifs.client.minVersion", "SMB1");
+props.setProperty("jcifs.client.maxVersion", "SMB311");
 ```
 
 ## 🔒 Security Best Practices
 
 ### Authentication
 - **Use domain authentication** when possible for better security
-- **Enable SMB signing** for data integrity: `jcifs.smb.client.signingPreferred=true`
-- **Prefer SMB3** for encryption: `jcifs.smb.client.minVersion=SMB300`
+- **Enable SMB signing** for data integrity: `jcifs.client.signingEnforced=true`
+  (`signingPreferred` does **not** enable signing on SMB2/SMB3 — see
+  [the support status](docs/SMB3_SUPPORT.md#jcifsclientsigningpreferred-does-not-enable-smb2-signing))
+- **Prefer SMB3** for encryption: `jcifs.client.minVersion=SMB300`
 - **Rotate credentials** regularly and implement credential renewal
 
 ### Network Security
-- **Use encrypted connections** when available (SMB3 encryption is automatic)
+- **Use encrypted connections** when available: set `jcifs.client.encryptionEnabled=true` (default `false`).
+  Once enabled, encryption is applied automatically to any session or share the server marks as requiring it.
+- **Fail closed** when encryption is mandatory: set `jcifs.client.encryptionRequired=true` (default `false`).
+  Every session is then encrypted, and a server that cannot or will not encrypt (no SMB 3.x, no cipher
+  negotiated, anonymous or guest session) fails with an error instead of downgrading to cleartext. Implies
+  advertising encryption during negotiation.
 - **Limit protocol versions** to minimum required for your environment
 - **Monitor failed authentication** attempts in logs
 - **Use VPN or secure networks** when accessing SMB over public networks
@@ -371,10 +428,9 @@ props.setProperty("jcifs.smb.client.maxVersion", "SMB311");
 ```java
 // Secure configuration example
 Properties secureConfig = new Properties();
-secureConfig.setProperty("jcifs.smb.client.minVersion", "SMB300");
-secureConfig.setProperty("jcifs.smb.client.enableSMB2Signing", "true");
-secureConfig.setProperty("jcifs.smb.client.signingPreferred", "true");
-secureConfig.setProperty("jcifs.smb.client.ipcSigningEnforced", "true");
+secureConfig.setProperty("jcifs.client.minVersion", "SMB300");
+secureConfig.setProperty("jcifs.client.signingEnforced", "true");
+secureConfig.setProperty("jcifs.client.ipcSigningEnforced", "true");
 ```
 
 ## 🛠️ Troubleshooting
@@ -384,9 +440,9 @@ secureConfig.setProperty("jcifs.smb.client.ipcSigningEnforced", "true");
 **Connection Timeouts**
 ```java
 // Increase timeout values
-props.setProperty("jcifs.smb.client.soTimeout", "35000");      // 35 seconds
-props.setProperty("jcifs.smb.client.connTimeout", "10000");    // 10 seconds
-props.setProperty("jcifs.smb.client.responseTimeout", "30000"); // 30 seconds
+props.setProperty("jcifs.client.soTimeout", "35000");      // 35 seconds
+props.setProperty("jcifs.client.connTimeout", "10000");    // 10 seconds
+props.setProperty("jcifs.client.responseTimeout", "30000"); // 30 seconds
 ```
 
 **Authentication Failures**
@@ -398,11 +454,12 @@ props.setProperty("jcifs.smb.client.responseTimeout", "30000"); // 30 seconds
 **Protocol Negotiation Issues**
 ```java
 // Debug protocol negotiation
-props.setProperty("jcifs.util.loglevel", "3");  // Enable debug logging
+// Enable debug logging through your SLF4J backend, e.g.
+//   <logger name="org.codelibs.jcifs.smb.internal.smb2" level="DEBUG"/>
 
 // Force specific protocol version if needed
-props.setProperty("jcifs.smb.client.minVersion", "SMB202");
-props.setProperty("jcifs.smb.client.maxVersion", "SMB202");
+props.setProperty("jcifs.client.minVersion", "SMB202");
+props.setProperty("jcifs.client.maxVersion", "SMB202");
 ```
 
 **Performance Issues**
@@ -429,8 +486,24 @@ JCIFS uses SLF4J for logging. Configure your logging framework accordingly:
 ### From JCIFS 2.x to 3.x
 - **Java 17+ required**: Update your runtime environment
 - **Package changes**: All classes moved to `org.codelibs.jcifs.smb`
+- **Property names changed**: the `.smb` segment was dropped from every configuration
+  key (see below). Old keys are *silently ignored*, so settings fall back to their
+  defaults until you rename them.
 - **Enhanced SMB3 support**: New encryption and signing capabilities
 - **Improved authentication**: Enhanced credential management
+
+#### Configuration property names
+
+| 2.x | 3.x |
+| --- | --- |
+| `jcifs.smb.client.<name>` | `jcifs.client.<name>` |
+| `jcifs.smb.<name>` (`lmCompatibility`, `maxBuffers`, `allowNTLMFallback`, `useRawNTLM`) | `jcifs.<name>` |
+| `jcifs.smb1.smb.client.<name>` (legacy SMB1 stack) | `jcifs.client.<name>` |
+| `jcifs.netbios.<name>`, `jcifs.http.<name>`, `jcifs.resolveOrder`, `jcifs.encoding` | unchanged |
+
+`PropertyConfiguration` logs a warning for every property it receives under one of the
+old prefixes, naming the key to use instead. The authoritative list of keys and their
+defaults is the `Configuration` interface javadoc.
 
 ### From Original JCIFS
 - **Context-based API**: Replace global configuration with contexts

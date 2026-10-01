@@ -32,7 +32,7 @@
 		<connection>scm:git:git@github.com:codelibs/jcifs.git</connection>
 		<developerConnection>scm:git:git@github.com:codelibs/jcifs.git</developerConnection>
 		<url>https://github.com/codelibs/jcifs</url>
-	  <tag>HEAD</tag>
+	  <tag>jcifs-3.0.4</tag>
   </scm>
 	<properties>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -47,8 +47,7 @@
 				<artifactId>maven-compiler-plugin</artifactId>
 				<version>3.15.0</version>
 				<configuration>
-					<source>17</source>
-					<target>17</target>
+					<release>17</release>
 					<encoding>UTF-8</encoding>
 				</configuration>
 			</plugin>
@@ -140,6 +139,36 @@
 							<differenceType>7012</differenceType>
 							<method>void setFileTimes(long, long, long)</method>
 						</difference>
+						<difference>
+							<className>org/codelibs/jcifs/smb/SmbWatchHandle</className>
+							<differenceType>7012</differenceType>
+							<method>void cancel()</method>
+						</difference>
+						<difference>
+							<className>org/codelibs/jcifs/smb/SmbRandomAccess</className>
+							<differenceType>7012</differenceType>
+							<method>void lock(long, long, boolean)</method>
+						</difference>
+						<difference>
+							<className>org/codelibs/jcifs/smb/SmbRandomAccess</className>
+							<differenceType>7012</differenceType>
+							<method>boolean tryLock(long, long, boolean)</method>
+						</difference>
+						<difference>
+							<className>org/codelibs/jcifs/smb/SmbRandomAccess</className>
+							<differenceType>7012</differenceType>
+							<method>void unlock(long, long)</method>
+						</difference>
+						<difference>
+							<className>org/codelibs/jcifs/smb/Configuration</className>
+							<differenceType>7012</differenceType>
+							<method>boolean isFollowSymlinks()</method>
+						</difference>
+						<difference>
+							<className>org/codelibs/jcifs/smb/Configuration</className>
+							<differenceType>7012</differenceType>
+							<method>boolean isCompressionEnabled()</method>
+						</difference>
 					</ignored>
 				</configuration>
 			</plugin>
@@ -165,6 +194,44 @@
 					<skipAfterFailureCount>0</skipAfterFailureCount>
 				</configuration>
 				<dependencies>
+					<dependency>
+						<groupId>org.apache.maven.surefire</groupId>
+						<artifactId>surefire-junit-platform</artifactId>
+						<version>3.5.5</version>
+					</dependency>
+				</dependencies>
+			</plugin>
+			<plugin>
+				<!-- Integration tests (*IT) talk to a real SMB server and run in the
+				     verify phase. surefire only includes *Test/*Tests/*TestCase/*TestSuite,
+				     so mvn test stays offline and fast. -->
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-failsafe-plugin</artifactId>
+				<version>3.5.5</version>
+				<configuration>
+					<includes>
+						<include>**/*IT.java</include>
+					</includes>
+					<systemPropertyVariables>
+						<networkaddress.cache.ttl>-1</networkaddress.cache.ttl>
+						<networkaddress.cache.negative.ttl>-1</networkaddress.cache.negative.ttl>
+					</systemPropertyVariables>
+					<useSystemClassLoader>false</useSystemClassLoader>
+					<useModulePath>false</useModulePath>
+					<forkCount>1</forkCount>
+					<reuseForks>true</reuseForks>
+				</configuration>
+				<executions>
+					<execution>
+						<goals>
+							<goal>integration-test</goal>
+							<goal>verify</goal>
+						</goals>
+					</execution>
+				</executions>
+				<dependencies>
+					<!-- Without this failsafe auto-detects the JUnit 4 provider and runs
+					     none of the JUnit 5 tests while still reporting success. -->
 					<dependency>
 						<groupId>org.apache.maven.surefire</groupId>
 						<artifactId>surefire-junit-platform</artifactId>
@@ -210,6 +277,9 @@
 						<exclude>*.md</exclude>
 						<exclude>build.properties</exclude>
 						<exclude>src/test/**</exclude>
+						<!-- Server-side fixtures for the integration tests: Dockerfile,
+						     smb.conf and shell/PowerShell setup scripts. -->
+						<exclude>build_helpers/**</exclude>
 						<exclude>**/*.idl</exclude>
 						<exclude>**/*.css</exclude>
 						<exclude>.*</exclude>
@@ -358,7 +428,7 @@
 		<dependency>
 			<groupId>org.bouncycastle</groupId>
 			<artifactId>bcprov-jdk18on</artifactId>
-			<version>1.84</version>
+			<version>1.85</version>
 		</dependency>
 		<dependency>
 			<groupId>org.junit.jupiter</groupId>

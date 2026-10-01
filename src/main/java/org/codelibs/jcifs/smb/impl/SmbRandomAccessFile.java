@@ -40,6 +40,8 @@ import org.codelibs.jcifs.smb.internal.smb2.io.Smb2ReadRequest;
 import org.codelibs.jcifs.smb.internal.smb2.io.Smb2ReadResponse;
 import org.codelibs.jcifs.smb.internal.smb2.io.Smb2WriteRequest;
 import org.codelibs.jcifs.smb.internal.smb2.io.Smb2WriteResponse;
+import org.codelibs.jcifs.smb.internal.smb2.lock.Smb2Lock;
+import org.codelibs.jcifs.smb.internal.smb2.lock.Smb2LockRequest;
 import org.codelibs.jcifs.smb.util.Encdec;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -108,7 +110,9 @@ public class SmbRandomAccessFile implements SmbRandomAccess {
 
         try (SmbTreeHandleInternal th = this.file.ensureTreeConnected()) {
             if (mode.equals("r")) {
-                this.openFlags = SmbConstants.O_CREAT | SmbConstants.O_RDONLY;
+                // Deliberately no O_CREAT: it becomes FILE_OPEN_IF, so opening for reading would bring a missing
+                // file into existence as an empty one instead of failing.
+                this.openFlags = SmbConstants.O_RDONLY;
                 this.access = SmbConstants.FILE_READ_DATA;
             } else if (mode.equals("rw")) {
                 this.openFlags = SmbConstants.O_CREAT | SmbConstants.O_RDWR | SmbConstants.O_APPEND;
@@ -120,6 +124,10 @@ public class SmbRandomAccessFile implements SmbRandomAccess {
             }
 
             try (SmbFileHandle h = ensureOpen()) {}
+            // The file is open by now, so a reopen after a dropped connection must not create it again: that would
+            // resurrect a file deleted in the meantime rather than failing, and ensureOpen() replays these flags as
+            // they stand.
+            this.openFlags &= ~SmbConstants.O_CREAT;
             this.readSize = th.getReceiveBufferSize() - 70;
             this.writeSize = th.getSendBufferSize() - 70;
 
@@ -162,6 +170,54 @@ public class SmbRandomAccessFile implements SmbRandomAccess {
      */
     public void open() throws CIFSException {
         try (SmbFileHandleImpl fh = ensureOpen()) {}
+    }
+
+    @Override
+    public void lock(final long position, final long size, final boolean shared) throws SmbException {
+        sendLock(new Smb2Lock(position, size, shared ? Smb2Lock.SMB2_LOCKFLAG_SHARED_LOCK : Smb2Lock.SMB2_LOCKFLAG_EXCLUSIVE_LOCK));
+    }
+
+    @Override
+    public boolean tryLock(final long position, final long size, final boolean shared) throws SmbException {
+        final int type = shared ? Smb2Lock.SMB2_LOCKFLAG_SHARED_LOCK : Smb2Lock.SMB2_LOCKFLAG_EXCLUSIVE_LOCK;
+        try {
+            sendLock(new Smb2Lock(position, size, type | Smb2Lock.SMB2_LOCKFLAG_FAIL_IMMEDIATELY));
+            return true;
+        } catch (final SmbException e) {
+            // A server that will not grant a lock asked to fail immediately answers STATUS_LOCK_NOT_GRANTED, and
+            // some answer STATUS_FILE_LOCK_CONFLICT instead. Either way the range is held by someone else, which is
+            // the answer this method exists to return rather than a failure to raise.
+            if (e.getNtStatus() == 0xC0000055 || e.getNtStatus() == 0xC0000054) {
+                log.debug("Range is already locked", e);
+                return false;
+            }
+            throw e;
+        }
+    }
+
+    @Override
+    public void unlock(final long position, final long size) throws SmbException {
+        sendLock(new Smb2Lock(position, size, Smb2Lock.SMB2_LOCKFLAG_UNLOCK));
+    }
+
+    /**
+     * Sends a single lock element against the open file.
+     *
+     * @param lock
+     *            the range and flags to send
+     * @throws SmbException if the request fails, or the connection is not SMB2
+     */
+    private void sendLock(final Smb2Lock lock) throws SmbException {
+        try (SmbFileHandleImpl fh = ensureOpen(); SmbTreeHandleImpl th = fh.getTree()) {
+            if (!th.isSMB2()) {
+                // SMB1 has LOCKING_ANDX, but this client only ever builds it to decode an inbound oplock break and
+                // has no outbound lock path at all, so there is nothing to fall back to here.
+                throw new SmbUnsupportedOperationException("Byte range locking requires SMB2 or later");
+            }
+            th.send(new Smb2LockRequest(th.getConfig(), fh.getFileId(), new Smb2Lock[] { lock }), RequestParam.NO_RETRY);
+        } catch (final CIFSException e) {
+            throw SmbException.wrap(e);
+        }
     }
 
     @Override
@@ -215,6 +271,9 @@ public class SmbRandomAccessFile implements SmbRandomAccess {
                     request.setOffset(this.fp);
                     request.setReadLength(r);
                     request.setRemainingBytes(len);
+                    if (th.isCompressionNegotiated()) {
+                        request.setReadFlags(Smb2ReadRequest.SMB2_READFLAG_REQUEST_COMPRESSED);
+                    }
                     try {
                         final Smb2ReadResponse resp = th.send(request, RequestParam.NO_RETRY);
                         n = resp.getDataLength();
@@ -361,6 +420,11 @@ public class SmbRandomAccessFile implements SmbRandomAccess {
                 th.send(new SmbComWrite(th.getConfig(), fh.getFid(), (int) (newLength & 0xFFFFFFFFL), 0, this.tmp, 0, 0), rsp,
                         RequestParam.NO_RETRY);
             }
+            // length() asks the resource, which serves the size from a cache that
+            // this request has just made wrong. Without this the handle keeps
+            // reporting the length the file had before it was resized, for as long
+            // as the attribute cache lives.
+            this.file.clearAttributeCache();
         } catch (final CIFSException e) {
             throw SmbException.wrap(e);
         }
